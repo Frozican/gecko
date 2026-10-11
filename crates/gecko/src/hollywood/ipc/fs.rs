@@ -18,7 +18,7 @@ const FS_EINVAL: i32 = -101;
 const FS_EEXIST: i32 = -105;
 pub const FS_ENOENT: i32 = -106;
 const FS_MAX_PATH: usize = 0x40;
-const FS_DIRENT_NAME_LEN: usize = 0x13;
+const FS_DIRENT_NAME_LEN: usize = 13;
 const FS_CREATE_INPUT_LEN: usize = 0x4A;
 const FS_RENAME_INPUT_LEN: usize = FS_MAX_PATH * 2;
 const FS_ATTR_OWNER_ID_OFFSET: u32 = 0x00;
@@ -571,10 +571,12 @@ fn read_dir_names(path: &Path) -> std::io::Result<Vec<String>> {
 fn write_dir_names(out: &mut [u8], entries: &[String]) {
     out.fill(0);
 
-    for (slot, name) in out.chunks_exact_mut(FS_DIRENT_NAME_LEN).zip(entries) {
+    let mut offset = 0;
+    for name in entries {
         let bytes = name.as_bytes();
         let len = bytes.len().min(FS_DIRENT_NAME_LEN - 1);
-        slot[..len].copy_from_slice(&bytes[..len]);
+        out[offset..offset + len].copy_from_slice(&bytes[..len]);
+        offset += len + 1;
     }
 }
 
