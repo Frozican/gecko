@@ -26,7 +26,7 @@ crate::mmio_reg!(CpStatus: u16 @ 0xCC000000);
 
 impl<const SYSTEM: SystemId> MmioAccess<System<SYSTEM>> for CpStatus {
     fn read(sys: &mut System<SYSTEM>) -> Self {
-        sys.cp.refresh_status();
+        sys.cp.refresh_status(!sys.gx.fifo.is_empty());
         sys.cp.status
     }
 

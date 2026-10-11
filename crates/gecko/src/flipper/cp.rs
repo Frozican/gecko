@@ -126,7 +126,7 @@ impl CommandProcessor {
         self.fifo_read_ptr_hi = regs::FifoReadPtrHi::from_raw((v >> 16) as u16);
     }
 
-    pub fn refresh_status(&mut self) {
+    pub fn refresh_status(&mut self, gx_pending: bool) {
         let dist = self.fifo_rw_distance();
         let hi = self.fifo_hi_watermark();
         let lo = self.fifo_lo_watermark();
@@ -136,7 +136,7 @@ impl CommandProcessor {
             .with_fifo_overflow(hi != 0 && dist > hi)
             .with_fifo_underflow(lo != 0 && dist < lo)
             .with_read_idle(read_idle)
-            .with_cmd_idle(read_idle)
+            .with_cmd_idle(read_idle && !gx_pending)
             .with_bp_interrupt(bp);
     }
 }
@@ -256,7 +256,7 @@ pub fn gather_pipe_bursted<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     }
 
     if linked {
-        sys.cp.refresh_status();
+        sys.cp.refresh_status(!sys.gx.fifo.is_empty());
         refresh_interrupts(sys);
     }
 }
@@ -298,11 +298,13 @@ pub fn pump_fifo<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
         consumed += 1;
     }
 
-    if consumed > 0 {
-        sys.gx.drain_fifo(&mut sys.mmio, sys.render_sink.as_mut());
+    // Yield after a token interrupt so the CPU can observe it before another
+    // token overwrites it.
+    if consumed > 0 || !sys.gx.fifo.is_empty() {
+        sys.gx.drain_fifo_until_token(&mut sys.mmio, sys.render_sink.as_mut());
         sys.gx.defer_pending_efb_writebacks(&mut sys.mmio);
         sys.check_gx_pe_interrupts();
-        sys.cp.refresh_status();
+        sys.cp.refresh_status(!sys.gx.fifo.is_empty());
         refresh_interrupts(sys);
     }
 
