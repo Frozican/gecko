@@ -71,30 +71,19 @@ Gecko is developed with homebrew development and reverse engineering in mind, bu
   - [incl. debugging capabilities](https://gecko.layle.dev/dbg)
 
 ## Usage
-Prebuilt releases (including debug builds) can be downloaded [here](https://github.com/ioncodes/gecko/releases). GameCube and Wii require system files to use the emulator, please refer to the ["Required Files"](https://github.com/ioncodes/gecko#required-files) chapter. Minimal commands to launch a game:
+Prebuilt releases (including debug builds) can be downloaded [here](https://github.com/ioncodes/gecko/releases). Gecko boots most games without any system files, using Dolphin's DSP ROM and an IPL HLE. Real dumps can still be used and are more accurate, please refer to the ["Required Files"](https://github.com/ioncodes/gecko#required-files) chapter.
 
-```sh
-# Launch a GameCube game with the built-in IPL HLE
-./tinyapp --dsp dsp_rom.bin --coef dsp_coef.bin --dvd YourGame.rvz
-
-# Launch a GameCube game with a real IPL (skip the boot animation)
-./tinyapp --ipl IPL.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --skip-ipl --dvd YourGame.rvz
-
-# Launch a Wii game
-./tinyapp --dsp dsp_rom.bin --coef dsp_coef.bin --dvd YourGame.rvz
-```
-
-A more modern and friendly experience is provided via `gecko` ([short preview on YouTube](https://www.youtube.com/watch?v=aCQSc70FV4k)):
+A modern and friendly experience is provided via `gecko` ([short preview on YouTube](https://www.youtube.com/watch?v=aCQSc70FV4k)):
 
 ![launcher](images/launcher.png)
 
-On first launch, a guided setup popup asks for your DSP ROM (`dsp_rom.bin`), DSP coefficient ROM (`dsp_coef.bin`), optional GameCube IPL and game folders. It validates and copies the system files with the correct names, automatically decodes an encoded IPL, saves your settings and scans your games. You can skip setup for now or reopen it from **Settings -> Guided Setup**.
+On first launch, a guided setup popup asks for an optional DSP ROM (`dsp_rom.bin`), DSP coefficient ROM (`dsp_coef.bin`), GameCube IPL and your game folders. It validates and copies the system files with the correct names, automatically decodes an encoded IPL, saves your settings and scans your games. You can skip setup for now or reopen it from **Settings -> Guided Setup**.
 
-Enable **Settings -> Boot -> IPL HLE (GameCube)** to boot GameCube discs using [Hazel's](https://codeberg.org/hazelwiss) built-in IPL replacement, even if a real IPL is installed. The setting is saved as `ipl_hle = true` in `config.toml` and applies the next time you launch a game. Guided setup enables HLE automatically if you leave the IPL file empty. Disable HLE to use your real IPL. **Skip IPL (GameCube)** then controls whether its boot animation is skipped. DSP ROMs are still required with either boot method.
+Enable **Settings -> Boot -> IPL HLE (GameCube)** to boot GameCube discs using [Hazel's](https://codeberg.org/hazelwiss) built-in IPL replacement, even if a real IPL is installed. The setting is saved as `ipl_hle = true` in `config.toml` and applies the next time you launch a game. Guided setup enables HLE automatically if you leave the IPL file empty. Disable HLE to use your real IPL. **Skip IPL (GameCube)** then controls whether its boot animation is skipped. Either boot method uses Dolphin's DSP ROM unless real DSP dumps are configured.
 
 You can also import an optional Wii NAND folder containing `title/` and `shared2/`. The wizard copies it into `fs/` (or `GECKO_FS_ROOT`) only if that destination does not already exist, preserving existing saves. Otherwise, leave NAND unselected to keep existing storage or generate it on first boot.
 
-The launcher scans the configured GameCube and Wii folders for `.iso`, `.rvz` and `.zip` files. Double-clicking on a row opens a dedicated player window for that game. For manual setup, place the DSP files and, if using real IPL boot, a decoded GameCube IPL inside `system` using the names below. Data paths are relative to the working directory or `GECKO_DATA_DIR` when set:
+The launcher scans the configured GameCube and Wii folders for `.iso`, `.rvz` and `.zip` files. Double-clicking on a row opens a dedicated player window for that game. For manual setup, place optional DSP dumps and, if using real IPL boot, a decoded GameCube IPL inside `system` using the names below. Data paths are relative to the working directory or `GECKO_DATA_DIR` when set:
 
 ```sh
 <gecko data dir>/
@@ -104,9 +93,22 @@ The launcher scans the configured GameCube and Wii folders for `.iso`, `.rvz` an
   internal/                  # contains SRAM and memory cards, auto-generated
   system/                    # system files, copied by guided setup
     IPL.bin                  # GameCube real IPL boot only (must be decoded! see multitool)
-    dsp_rom.bin              # GameCube and Wii
-    dsp_coef.bin             # GameCube and Wii
+    dsp_rom.bin              # optional, GameCube and Wii
+    dsp_coef.bin             # optional, GameCube and Wii
   fs/                        # Wii NAND, auto-generated if missing (or drop in a Dolphin/real dump)
+```
+
+If you're a developer you may want to use `tinyapp` or `debugger` instead, the quickest way to boot up a game is:
+
+```sh
+# Launch a GameCube game with the built-in IPL HLE and Dolphin's DSP ROM
+./tinyapp --dvd YourGame.rvz
+
+# Launch a GameCube game with a real IPL (skip the boot animation)
+./tinyapp --ipl IPL.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --skip-ipl --dvd YourGame.rvz
+
+# Launch a Wii game with real DSP dumps (optional)
+./tinyapp --dsp dsp_rom.bin --coef dsp_coef.bin --dvd YourGame.rvz
 ```
 
 ### Controls
@@ -273,6 +275,9 @@ The panel also provides a speed slider and `Reset view` button. Game input is su
 
 Gecko does not ship original console ROMs. A built-in IPL HLE replacement is available for GameCube disc boot.
 
+> [!NOTE]
+> Gecko embeds Dolphin's DSP ROM replacement (`dsp_rom.bin` and `dsp_coef.bin` from [`Data/Sys/GC`](https://github.com/dolphin-emu/dolphin/tree/master/Data/Sys/GC), source in [`docs/DSP/free_dsp_rom`](https://github.com/dolphin-emu/dolphin/tree/master/docs/DSP/free_dsp_rom)) and uses it whenever no DSP dump is provided. It is written by the Dolphin team, not dumped from hardware. It covers the common AX and Zelda audio ucodes, however, it may still cause issues. If anything misbehaves, try real dumps.
+
 Reference SHA-256 hashes (these are the files the project is developed against):
 
 | File                         | SHA-256                                                            |
@@ -286,8 +291,8 @@ Reference SHA-256 hashes (these are the files the project is developed against):
 
 ### GameCube
 - IPL for real IPL boot only (NTSC and PAL tested); not required with IPL HLE
-- DSP IROM
-- DSP coefficient ROM
+- DSP IROM (optional, Dolphin's is used by default)
+- DSP coefficient ROM (optional, Dolphin's is used by default)
 
 For IPL HLE in `tinyapp`, pass `--dvd` without `--ipl`. In the `gecko` app, enable **Settings -> Boot -> IPL HLE (GameCube)**.
 
@@ -316,7 +321,7 @@ multitool setting --action decode fs/title/00000001/00000002/data/setting.txt se
 multitool setting --action encode setting.decoded fs/title/00000001/00000002/data/setting.txt
 multitool dvd --extract game.rvz
 
-tinyapp --dol homebrew.dol  # may also require a DSP depending on the DOL
+tinyapp --dol homebrew.dol
 tinyapp --dvd game.iso --ipl ipl.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --skip-ipl
 
 debugger --dvd game.rvz --ipl ipl.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --script example.lua

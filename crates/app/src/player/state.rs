@@ -89,15 +89,7 @@ impl PlayerState {
         } else {
             Config::resolve_in_dir(&config.ipl, &system_dir, IPL_FILE)
         };
-        let boot_error = self::validate(
-            game.platform,
-            game.format,
-            &dsp,
-            &coef,
-            &ipl,
-            config.ipl_hle,
-            &system_dir,
-        );
+        let boot_error = self::validate(game.platform, game.format, &ipl, config.ipl_hle, &system_dir);
 
         Arc::new(Self {
             boot: Mutex::new(Some(BootParams {
@@ -462,42 +454,18 @@ fn set_initialized(state: &Arc<PlayerState>, renderer: Renderer, audio: Option<c
 fn validate(
     platform: Platform,
     format: Format,
-    dsp: &Option<PathBuf>,
-    coef: &Option<PathBuf>,
     ipl: &Option<PathBuf>,
     ipl_hle: bool,
     system_dir: &Path,
 ) -> Option<String> {
-    let mut missing: Vec<&'static str> = Vec::new();
-    if dsp.is_none() {
-        missing.push(DSP_ROM_FILE);
-    }
-    if coef.is_none() {
-        missing.push(DSP_COEF_FILE);
-    }
-    if platform == Platform::Gcn && format != Format::Dol && !ipl_hle && ipl.is_none() {
-        missing.push(IPL_FILE);
-    }
-
-    if missing.is_empty() {
+    if platform != Platform::Gcn || format == Format::Dol || ipl_hle || ipl.is_some() {
         return None;
     }
 
-    let needed = if format == Format::Dol {
-        "DOL executables require dsp_rom.bin and dsp_coef.bin"
-    } else {
-        match platform {
-            Platform::Gcn if !ipl_hle => {
-                "GameCube games require IPL.bin, dsp_rom.bin and dsp_coef.bin. Enable Settings > Boot > IPL HLE (GameCube) to boot without IPL.bin"
-            }
-            Platform::Gcn => "GameCube games require dsp_rom.bin and dsp_coef.bin with IPL HLE",
-            Platform::Wii => "Wii games require dsp_rom.bin and dsp_coef.bin",
-        }
-    };
-
     Some(format!(
-        "{needed}.\n\nMissing: {}\n\nPlace them under {} or set explicit paths in config.toml.",
-        missing.join(", "),
+        "GameCube games require {IPL_FILE}. Enable Settings > Boot > IPL HLE (GameCube) to boot without it.
+
+Place it under {} or set an explicit path in config.toml.",
         system_dir.display(),
     ))
 }

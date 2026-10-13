@@ -417,11 +417,11 @@ struct Args {
     #[arg(long)]
     immediate: bool,
 
-    /// Path to a DSP IROM binary
+    /// Path to a DSP IROM binary (defaults to Dolphin's DSP ROM)
     #[arg(long)]
     dsp: Option<String>,
 
-    /// Path to a DSP coefficient ROM binary
+    /// Path to a DSP coefficient ROM binary (defaults to Dolphin's DSP ROM)
     #[arg(long)]
     coef: Option<String>,
 

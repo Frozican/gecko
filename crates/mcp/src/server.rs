@@ -249,9 +249,9 @@ impl McpServer {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             boot::boot(
                 bytes,
-                &self.shared.ipl,
-                &self.shared.dsp_rom,
-                &self.shared.coef_rom,
+                self.shared.ipl.as_deref(),
+                self.shared.dsp_rom.as_deref(),
+                self.shared.coef_rom.as_deref(),
                 self.shared.gx.clone(),
                 self.shared.device.clone(),
                 self.shared.queue.clone(),

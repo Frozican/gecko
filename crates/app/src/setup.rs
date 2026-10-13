@@ -24,8 +24,8 @@ pub enum Field {
 impl Field {
     fn info(self) -> (&'static str, &'static str) {
         match self {
-            Self::Dsp => ("DSP ROM", "Required"),
-            Self::Coef => ("DSP coefficients", "Required"),
+            Self::Dsp => ("DSP ROM", "Optional"),
+            Self::Coef => ("DSP coefficients", "Optional"),
             Self::Ipl => ("GameCube IPL", "Optional"),
             Self::GameCube => ("GameCube games", "Optional"),
             Self::Wii => ("Wii games", "Optional"),
@@ -130,10 +130,7 @@ impl Setup {
 
     pub fn needed(&self, cfg: &Config, config_exists: bool) -> bool {
         !cfg.setup_completed
-            && (!config_exists
-                || self.sources.dsp.is_none()
-                || self.sources.coef.is_none()
-                || (cfg.gcn_library.is_some() && !cfg.ipl_hle && self.sources.ipl.is_none()))
+            && (!config_exists || (cfg.gcn_library.is_some() && !cfg.ipl_hle && self.sources.ipl.is_none()))
     }
 
     pub fn view(&self, palette: &Palette, cfg: &Config) -> Element<'static, Message> {
@@ -171,7 +168,7 @@ impl Setup {
         let fields_and_note = match self.step {
             Step::System => Some((
                 [Field::Dsp, Field::Coef, Field::Ipl],
-                "Leave IPL empty to use IPL HLE for GameCube. Encoded IPLs are decoded automatically.",
+                "Leave DSP files empty to use Dolphin's DSP ROM. Leave IPL empty to use IPL HLE for GameCube. Encoded IPLs are decoded automatically.",
             )),
             Step::Folders => Some((
                 [Field::GameCube, Field::Wii, Field::Nand],
@@ -190,10 +187,18 @@ impl Setup {
             }
             content = content.push(rows).push(self::note(note, palette));
         } else {
-            let names = if self.sources.ipl.is_some() {
-                format!("{DSP_ROM_FILE} · {DSP_COEF_FILE} · {IPL_FILE}")
+            let names = [
+                (self.sources.dsp.is_some(), DSP_ROM_FILE),
+                (self.sources.coef.is_some(), DSP_COEF_FILE),
+                (self.sources.ipl.is_some(), IPL_FILE),
+            ]
+            .into_iter()
+            .filter_map(|(selected, name)| selected.then_some(name))
+            .collect::<Vec<_>>();
+            let names = if names.is_empty() {
+                "None, using Dolphin's DSP ROM and IPL HLE".to_string()
             } else {
-                format!("{DSP_ROM_FILE} · {DSP_COEF_FILE}")
+                names.join(" · ")
             };
             content = content
                 .push(self::summary_row("System files", &cfg.system_dir_resolved(), palette))
@@ -440,19 +445,13 @@ fn read_rom(path: &Path, size: usize) -> anyhow::Result<Vec<u8>> {
 }
 
 fn system_files(sources: &Sources) -> anyhow::Result<Vec<(&'static str, Vec<u8>)>> {
-    let dsp = sources
-        .dsp
-        .as_deref()
-        .context("Choose the DSP ROM before continuing.")?;
-    let coef = sources
-        .coef
-        .as_deref()
-        .context("Choose the DSP coefficient ROM before continuing.")?;
-
-    let mut files = vec![
-        (DSP_ROM_FILE, self::read_rom(dsp, 8192)?),
-        (DSP_COEF_FILE, self::read_rom(coef, 4096)?),
-    ];
+    let mut files = Vec::new();
+    if let Some(path) = &sources.dsp {
+        files.push((DSP_ROM_FILE, self::read_rom(path, 8192)?));
+    }
+    if let Some(path) = &sources.coef {
+        files.push((DSP_COEF_FILE, self::read_rom(path, 4096)?));
+    }
 
     if let Some(path) = &sources.ipl {
         let mut data = self::read_rom(path, image::ipl::IPL_ROM_SIZE)?;
@@ -569,8 +568,12 @@ pub fn install(sources: Sources, mut cfg: Config, config_path: &Path, nand_dest:
         fs::rename(stage.path().join("nand"), nand_dest).context("Cannot install Wii NAND")?;
     }
 
-    cfg.dsp_rom = Some(system.join(DSP_ROM_FILE));
-    cfg.dsp_coef = Some(system.join(DSP_COEF_FILE));
+    if sources.dsp.is_some() {
+        cfg.dsp_rom = Some(system.join(DSP_ROM_FILE));
+    }
+    if sources.coef.is_some() {
+        cfg.dsp_coef = Some(system.join(DSP_COEF_FILE));
+    }
     if sources.ipl.is_some() {
         cfg.ipl = Some(system.join(IPL_FILE));
     } else {

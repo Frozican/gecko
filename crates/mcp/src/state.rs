@@ -94,9 +94,9 @@ pub struct Shared {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub introspect: Arc<Mutex<Introspection>>,
-    pub ipl: Vec<u8>,
-    pub dsp_rom: Vec<u8>,
-    pub coef_rom: Vec<u8>,
+    pub ipl: Option<Vec<u8>>,
+    pub dsp_rom: Option<Vec<u8>>,
+    pub coef_rom: Option<Vec<u8>>,
 }
 
 impl Shared {

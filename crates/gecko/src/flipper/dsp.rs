@@ -9,6 +9,11 @@ pub mod interpreter;
 pub mod jit;
 pub mod regs;
 
+// Dolphin's DSP IROM/coefficient replacement, used until a real dump is loaded
+// (see submodules/dolphin/docs/DSP/free_dsp_rom).
+pub static FREE_IROM: &[u8] = include_bytes!("../../../../submodules/dolphin/Data/Sys/GC/dsp_rom.bin");
+pub static FREE_COEF: &[u8] = include_bytes!("../../../../submodules/dolphin/Data/Sys/GC/dsp_coef.bin");
+
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut {
     include!(concat!(env!("OUT_DIR"), "/dsp_lut.rs"));
@@ -114,12 +119,14 @@ impl Dsp {
     pub fn new() -> Self {
         let aram = unsafe { Box::<[u8; 16 * 1024 * 1024]>::new_zeroed().assume_init() };
         let iram = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
-        let irom = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        let mut irom = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        irom[..FREE_IROM.len()].copy_from_slice(FREE_IROM);
         let dram = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
-        let coef = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        let mut coef = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        coef[..FREE_COEF.len()].copy_from_slice(FREE_COEF);
         let ifx = unsafe { Box::<[u8; 0x200]>::new_zeroed().assume_init() };
 
-        Dsp {
+        let mut dsp = Dsp {
             registers: core::Registers::default(),
             iram,
             irom,
@@ -156,7 +163,9 @@ impl Dsp {
             wait_table: vec![WaitCondition::None; 0x10000].into_boxed_slice(),
             scheduler_suspended: false,
             pending_exceptions: 0,
-        }
+        };
+        dsp.rebuild_wait_table();
+        dsp
     }
 
     #[inline(always)]

@@ -10,10 +10,6 @@ use gecko::wii::Wii;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-const IPL: &[u8] = include_bytes!("../../../../private/IPL.decoded.bin");
-const DSP: &[u8] = include_bytes!("../../../../private/dsp_rom.bin");
-const COEF: &[u8] = include_bytes!("../../../../private/dsp_coef.bin");
-
 fn take_screenshot(device: &wgpu::Device, queue: &wgpu::Queue, gx: &GxRenderer, code: &str, frame: u32, is_wii: bool) {
     let _ = device.poll(wgpu::PollType::Wait {
         submission_index: None,
@@ -86,8 +82,6 @@ fn run_one(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::Tex
 
     if is_wii {
         let mut wii = Wii::apploader_hle(image).build();
-        wii.dsp.load_irom(DSP);
-        wii.dsp.load_coef(COEF);
         wii.render_sink = Box::new(sink);
         drive(
             &mut wii,
@@ -99,11 +93,8 @@ fn run_one(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::Tex
             update_wii_input,
         );
     } else {
-        let mut gamecube = GameCube::with_ipl(IPL, true);
-        gamecube.dsp.load_irom(DSP);
-        gamecube.dsp.load_coef(COEF);
+        let mut gamecube = GameCube::with_ipl_hle(image);
         gamecube.render_sink = Box::new(sink);
-        gamecube.insert_dvd(image);
         drive(
             &mut gamecube,
             device,
