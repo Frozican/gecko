@@ -87,6 +87,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
         } else {
             0
         };
+        self.mmio.fastmem_lut[(base >> crate::mmio::FASTMEM_PAGE_SHIFT) as usize] = self.mmio.lcache_fastmem_ptr;
     }
 
     #[cold]

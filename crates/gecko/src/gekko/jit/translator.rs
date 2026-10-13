@@ -2505,6 +2505,13 @@ pub(crate) fn emit_fastmem_lookup<const SYSTEM: SystemId>(
 
     let page_off_u32 = builder.ins().band_imm(ea, crate::mmio::FASTMEM_PAGE_MASK as i64);
     let page_off = builder.ins().uextend(types::I64, page_off_u32);
+    let in_page = builder.ins().icmp_imm(
+        IntCC::UnsignedLessThanOrEqual,
+        page_off_u32,
+        (crate::mmio::FASTMEM_PAGE_BYTES - 8) as i64,
+    );
+    let zero = builder.ins().iconst(types::I64, 0);
+    let host_ptr = builder.ins().select(in_page, host_ptr, zero);
 
     (host_ptr, page_off)
 }

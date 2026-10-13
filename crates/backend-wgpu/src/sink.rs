@@ -297,7 +297,7 @@ impl ThreadedSink {
     }
 
     fn reclaim_batch(&mut self) {
-        if !self.pending_actions.is_empty() || !self.scratch.is_empty() {
+        if self.pending_actions.capacity() != 0 || self.scratch.capacity() != 0 {
             return;
         }
 

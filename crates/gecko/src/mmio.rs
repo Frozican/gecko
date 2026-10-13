@@ -8,10 +8,11 @@ use crate::system::{SystemId, WII};
 use constants::*;
 use rustc_hash::FxHashSet;
 
-pub const FASTMEM_LUT_PAGES: usize = 1 << 15;
-pub const FASTMEM_PAGE_BYTES: usize = 1 << 17;
+// A page must fit the entire locked cache without mapping bytes beyond it.
+pub const FASTMEM_LUT_PAGES: usize = 1 << 18;
+pub const FASTMEM_PAGE_BYTES: usize = 1 << 14;
 pub const FASTMEM_PAGE_MASK: u32 = (FASTMEM_PAGE_BYTES as u32) - 1;
-pub const FASTMEM_PAGE_SHIFT: u32 = 17;
+pub const FASTMEM_PAGE_SHIFT: u32 = 14;
 
 pub const CODE_LINE_BYTES: u32 = 32;
 pub const CODE_LINE_SHIFT: u32 = 5;

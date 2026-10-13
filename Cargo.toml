@@ -61,6 +61,19 @@ iced_futures = { git = "https://github.com/iced-rs/iced.git", rev = "0d12e964da8
 iced_program = { git = "https://github.com/iced-rs/iced.git", rev = "0d12e964da8c3f0f7a02d3d731e3187eecfe5779" }
 iced_debug = { git = "https://github.com/iced-rs/iced.git", rev = "0d12e964da8c3f0f7a02d3d731e3187eecfe5779" }
 
+# wgpu fork (v29.0.3 + system-memory upload staging on Vulkan)
+# fixes performance issues on Vulkan backend for games like Sam & Max Season 1
+wgpu = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-core = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-hal = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-types = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-naga-bridge = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+naga = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-core-deps-apple = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-core-deps-emscripten = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-core-deps-wasm = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/ioncodes/wgpu", branch = "gecko" }
+
 [profile.release]
 codegen-units = 1
 lto = "fat"
