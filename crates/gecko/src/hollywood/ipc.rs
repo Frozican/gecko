@@ -25,6 +25,26 @@ pub struct DeviceContext<'a> {
     pub di: &'a mut DvdInterface,
     pub pi: &'a mut ProcessorInterface,
     pub device_path: String,
+    pub reload_ios: Option<&'static crate::wii::ios::MemoryValues>,
+}
+
+/// Guest address of ioctlv vector `idx`.
+#[inline(always)]
+pub(crate) fn vec_data<const SYS: SystemId>(mmio: &Mmio<SYS>, vec_ptr: u32, idx: u32) -> u32 {
+    mmio.phys_read_u32(vec_ptr + idx * 8)
+}
+
+/// Length of ioctlv vector `idx`.
+#[inline(always)]
+pub(crate) fn vec_len<const SYS: SystemId>(mmio: &Mmio<SYS>, vec_ptr: u32, idx: u32) -> u32 {
+    mmio.phys_read_u32(vec_ptr + idx * 8 + 4)
+}
+
+/// Whether the ioctlv vectors have exactly the lengths in `lens`.
+pub(crate) fn vec_lens_match<const SYS: SystemId>(mmio: &Mmio<SYS>, vec_ptr: u32, lens: &[u32]) -> bool {
+    (0..)
+        .zip(lens)
+        .all(|(idx, &len)| self::vec_len(mmio, vec_ptr, idx) == len)
 }
 
 pub trait IosDevice: Send {

@@ -382,6 +382,17 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
     }
 
     #[inline(always)]
+    pub fn phys_read_u64(&self, addr: u32) -> u64 {
+        ((self.phys_read_u32(addr) as u64) << 32) | self.phys_read_u32(addr + 4) as u64
+    }
+
+    #[inline(always)]
+    pub fn phys_write_u64(&mut self, addr: u32, value: u64) {
+        self.phys_write_u32(addr, (value >> 32) as u32);
+        self.phys_write_u32(addr + 4, value as u32);
+    }
+
+    #[inline(always)]
     pub fn phys_write_u8(&mut self, addr: u32, value: u8) {
         let (slice, offset) = self.resolve_mut(addr);
         tracing::trace!(

@@ -3,9 +3,11 @@ use crate::hollywood::ipc::{DeviceContext, IPC_EINVAL, IosDevice};
 use zerocopy::byteorder::big_endian::U32;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
+pub const IOCTL_DVD_READ_DISC_ID: u32 = 0x70;
 pub const IOCTL_DVD_LOW_READ: u32 = 0x71;
 pub const IOCTL_DVD_LOW_GET_COVER_REGISTER: u32 = 0x7A;
 pub const IOCTL_DVD_LOW_CLEAR_COVER_INTERRUPT: u32 = 0x86;
+pub const IOCTL_DVD_LOW_OPEN_PARTITION: u32 = 0x8B;
 pub const IOCTL_DVD_LOW_UNENCRYPTED_READ: u32 = 0x8D;
 pub const IOCTL_DVD_LOW_GET_STATUS_REGISTER: u32 = 0x95;
 pub const IOCTL_DVD_LOW_GET_CONTROL_REGISTER: u32 = 0x96;
@@ -36,6 +38,22 @@ impl DiskInterface {
 }
 
 impl IosDevice for DiskInterface {
+    fn ioctlv(&mut self, ctx: &mut DeviceContext<'_>, cmd: u32, in_count: u32, io_count: u32, vec_ptr: u32) -> i32 {
+        match cmd {
+            IOCTL_DVD_LOW_OPEN_PARTITION => self.dvd_low_open_partition(ctx, in_count, io_count, vec_ptr),
+            _ => {
+                tracing::warn!(
+                    cmd = format!("{cmd:#010X}"),
+                    in_count,
+                    io_count,
+                    vec_ptr = format!("{vec_ptr:#010X}"),
+                    "Unknown IOCTLV"
+                );
+                IPC_EINVAL
+            }
+        }
+    }
+
     fn save_state(&mut self, w: &mut crate::savestate::StateWriter) {
         w.u32(self.last_error);
     }
@@ -55,6 +73,7 @@ impl IosDevice for DiskInterface {
         out_len: u32,
     ) -> i32 {
         match cmd {
+            IOCTL_DVD_READ_DISC_ID => self.dvd_read_disc_id(ctx, out_ptr, out_len),
             IOCTL_DVD_LOW_UNENCRYPTED_READ => self.dvd_low_unencrypted_read(ctx, in_ptr, out_ptr, out_len),
             IOCTL_DVD_LOW_REQUEST_ERROR => self.dvd_low_request_error(ctx, in_ptr, out_ptr, out_len),
             IOCTL_DVD_LOW_REPORT_KEY => self.dvd_low_report_key(ctx, in_ptr, out_ptr, out_len),
@@ -81,6 +100,86 @@ impl IosDevice for DiskInterface {
 }
 
 impl DiskInterface {
+    fn dvd_low_open_partition(
+        &mut self,
+        ctx: &mut DeviceContext<'_>,
+        in_count: u32,
+        io_count: u32,
+        vec_ptr: u32,
+    ) -> i32 {
+        if in_count != 3 || io_count != 2 {
+            return DI_RET_SECURITY_ERROR;
+        }
+        if !super::vec_lens_match(ctx.mmio, vec_ptr, &[0x20]) || super::vec_len(ctx.mmio, vec_ptr, 4) < 4 {
+            return DI_RET_SECURITY_ERROR;
+        }
+
+        let in_ptr = super::vec_data(ctx.mmio, vec_ptr, 0);
+        let tmd_ptr = super::vec_data(ctx.mmio, vec_ptr, 3);
+        let result_ptr = super::vec_data(ctx.mmio, vec_ptr, 4);
+        if (in_ptr & 3) != 0 || (tmd_ptr & 0x1F) != 0 || (result_ptr & 3) != 0 {
+            return DI_RET_BAD_ALIGNMENT;
+        }
+
+        let partition_offset = (ctx.mmio.phys_read_u32(in_ptr + 4) as u64) << 2;
+        let Some(dvd) = ctx.di.dvd.as_ref() else {
+            self.last_error = DI_ERROR_LBA_OUT_OF_RANGE;
+            return DI_RET_ERROR;
+        };
+
+        if !dvd.header().is_wii() || partition_offset != dvd.data_partition_offset() {
+            self.last_error = DI_ERROR_LBA_OUT_OF_RANGE;
+            return DI_RET_ERROR;
+        }
+
+        let (tmd_size, tmd_offset) = dvd.tmd_descriptor();
+        if super::vec_len(ctx.mmio, vec_ptr, 3) < tmd_size {
+            return DI_RET_SECURITY_ERROR;
+        }
+
+        dvd.read_raw_disc(tmd_offset, ctx.mmio.phys_slice_mut(tmd_ptr, tmd_size as usize));
+        ctx.mmio.phys_write_u32(result_ptr, 0);
+
+        #[cfg(feature = "jit")]
+        ctx.mmio.queue_icbi_for_range(tmd_ptr, tmd_size);
+
+        self.last_error = DI_ERROR_OK;
+
+        tracing::debug!(
+            partition_offset = format!("{partition_offset:#011X}"),
+            tmd_size,
+            dst = format!("{tmd_ptr:#010X}"),
+            "DVDLowOpenPartition"
+        );
+        DI_RET_OK
+    }
+
+    #[inline(always)]
+    fn dvd_read_disc_id(&mut self, ctx: &mut DeviceContext<'_>, out_ptr: u32, out_len: u32) -> i32 {
+        if (out_ptr & 0x1F) != 0 {
+            return DI_RET_BAD_ALIGNMENT;
+        }
+        if out_len < 0x20 {
+            return DI_RET_SECURITY_ERROR;
+        }
+
+        let Some(dvd) = ctx.di.dvd.as_ref() else {
+            self.last_error = DI_ERROR_LBA_OUT_OF_RANGE;
+            return DI_RET_ERROR;
+        };
+
+        let dst = ctx.mmio.phys_slice_mut(out_ptr, 0x20);
+        dvd.read_raw_disc(0, dst);
+
+        #[cfg(feature = "jit")]
+        ctx.mmio.queue_icbi_for_range(out_ptr, 0x20);
+
+        self.last_error = DI_ERROR_OK;
+
+        tracing::debug!(dst = format!("{out_ptr:#010X}"), "DVDLowReadDiskID");
+        DI_RET_OK
+    }
+
     #[inline(always)]
     fn dvd_low_unencrypted_read(
         &mut self,

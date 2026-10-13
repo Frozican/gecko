@@ -137,11 +137,11 @@ impl FileSystem {
             }
         };
 
-        let path_ptr = self::vec_data(ctx, vec_ptr, 0);
-        let path_len = self::vec_len(ctx, vec_ptr, 0) as usize;
+        let path_ptr = super::vec_data(ctx.mmio, vec_ptr, 0);
+        let path_len = super::vec_len(ctx.mmio, vec_ptr, 0) as usize;
         let count_idx = if with_names { 3 } else { 1 };
-        let count_ptr = self::vec_data(ctx, vec_ptr, count_idx);
-        let count_len = self::vec_len(ctx, vec_ptr, count_idx);
+        let count_ptr = super::vec_data(ctx.mmio, vec_ptr, count_idx);
+        let count_len = super::vec_len(ctx.mmio, vec_ptr, count_idx);
 
         if path_len < FS_MAX_PATH || count_len < 4 {
             tracing::warn!(path_len, count_len, "FS_ReadDir: invalid vector sizes");
@@ -203,10 +203,10 @@ impl FileSystem {
             return 0;
         }
 
-        let max_count_ptr = self::vec_data(ctx, vec_ptr, 1);
-        let max_count_len = self::vec_len(ctx, vec_ptr, 1);
-        let names_ptr = self::vec_data(ctx, vec_ptr, 2);
-        let names_len = self::vec_len(ctx, vec_ptr, 2);
+        let max_count_ptr = super::vec_data(ctx.mmio, vec_ptr, 1);
+        let max_count_len = super::vec_len(ctx.mmio, vec_ptr, 1);
+        let names_ptr = super::vec_data(ctx.mmio, vec_ptr, 2);
+        let names_len = super::vec_len(ctx.mmio, vec_ptr, 2);
 
         if max_count_len < 4 {
             tracing::warn!(max_count_len, "FS_ReadDir: invalid max count vector size");
@@ -310,12 +310,12 @@ impl FileSystem {
             return FS_EINVAL;
         }
 
-        let path_ptr = self::vec_data(ctx, vec_ptr, 0);
-        let path_len = self::vec_len(ctx, vec_ptr, 0) as usize;
-        let used_clusters_ptr = self::vec_data(ctx, vec_ptr, 1);
-        let used_clusters_len = self::vec_len(ctx, vec_ptr, 1);
-        let used_inodes_ptr = self::vec_data(ctx, vec_ptr, 2);
-        let used_inodes_len = self::vec_len(ctx, vec_ptr, 2);
+        let path_ptr = super::vec_data(ctx.mmio, vec_ptr, 0);
+        let path_len = super::vec_len(ctx.mmio, vec_ptr, 0) as usize;
+        let used_clusters_ptr = super::vec_data(ctx.mmio, vec_ptr, 1);
+        let used_clusters_len = super::vec_len(ctx.mmio, vec_ptr, 1);
+        let used_inodes_ptr = super::vec_data(ctx.mmio, vec_ptr, 2);
+        let used_inodes_len = super::vec_len(ctx.mmio, vec_ptr, 2);
 
         if path_len < FS_MAX_PATH || used_clusters_len < 4 || used_inodes_len < 4 {
             tracing::warn!(
@@ -670,14 +670,4 @@ fn read_guest_path(ctx: &DeviceContext<'_>, ptr: u32, len: usize) -> Option<Stri
     let bytes = ctx.mmio.phys_slice(ptr, len);
     let end = bytes.iter().position(|&b| b == 0)?;
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
-}
-
-#[inline(always)]
-fn vec_data(ctx: &DeviceContext<'_>, vec_ptr: u32, idx: u32) -> u32 {
-    ctx.mmio.phys_read_u32(vec_ptr + idx * 8)
-}
-
-#[inline(always)]
-fn vec_len(ctx: &DeviceContext<'_>, vec_ptr: u32, idx: u32) -> u32 {
-    ctx.mmio.phys_read_u32(vec_ptr + idx * 8 + 4)
 }

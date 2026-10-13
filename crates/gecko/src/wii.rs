@@ -148,6 +148,24 @@ impl Wii {
     }
 
     // Cross referenced with beanwii and Dolphin!!
+    pub(crate) fn write_ios_low_memory(emu: &mut Wii, imv: &ios::MemoryValues) {
+        // MEM2 layout.
+        emu.mmio.phys_write_u32(0x0000_3118, imv.mem2_physical_size);
+        emu.mmio.phys_write_u32(0x0000_311C, imv.mem2_simulated_size);
+        emu.mmio.phys_write_u32(0x0000_3120, imv.mem2_end);
+        emu.mmio.phys_write_u32(0x0000_3124, imv.mem2_arena_begin);
+        emu.mmio.phys_write_u32(0x0000_3128, imv.mem2_arena_end);
+
+        // IPC buffer (ARM <-> PPC shared region).
+        emu.mmio.phys_write_u32(0x0000_3130, imv.ipc_buffer_begin);
+        emu.mmio.phys_write_u32(0x0000_3134, imv.ipc_buffer_end);
+
+        // IOS version + reserved heap.
+        emu.mmio.phys_write_u32(0x0000_3140, imv.ios_version);
+        emu.mmio.phys_write_u32(0x0000_3148, imv.ios_reserved_begin);
+        emu.mmio.phys_write_u32(0x0000_314C, imv.ios_reserved_end);
+    }
+
     fn setup_low_memory_common(emu: &mut Wii, imv: &ios::MemoryValues) {
         // Ripped from the apploader.
         emu.mmio
@@ -183,25 +201,12 @@ impl Wii {
         // entry is >= 0x80004000; this is the fallback.
         emu.mmio.phys_write_u32(0x0000_3110, imv.mem1_arena_end);
 
-        // MEM2 layout.
-        emu.mmio.phys_write_u32(0x0000_3118, imv.mem2_physical_size);
-        emu.mmio.phys_write_u32(0x0000_311C, imv.mem2_simulated_size);
-        emu.mmio.phys_write_u32(0x0000_3120, imv.mem2_end);
-        emu.mmio.phys_write_u32(0x0000_3124, imv.mem2_arena_begin);
-        emu.mmio.phys_write_u32(0x0000_3128, imv.mem2_arena_end);
-
-        // IPC buffer (ARM <-> PPC shared region).
-        emu.mmio.phys_write_u32(0x0000_3130, imv.ipc_buffer_begin);
-        emu.mmio.phys_write_u32(0x0000_3134, imv.ipc_buffer_end);
+        Self::write_ios_low_memory(emu, imv);
 
         // Hollywood revision.
         emu.mmio.phys_write_u32(0x0000_3138, imv.hollywood_revision);
 
-        // IOS version + date + reserved heap.
-        emu.mmio.phys_write_u32(0x0000_3140, imv.ios_version);
         emu.mmio.phys_write_u32(0x0000_3144, imv.ios_date);
-        emu.mmio.phys_write_u32(0x0000_3148, imv.ios_reserved_begin);
-        emu.mmio.phys_write_u32(0x0000_314C, imv.ios_reserved_end);
 
         // GDDR vendor code.
         emu.mmio.phys_write_u32(0x0000_3158, imv.ram_vendor);

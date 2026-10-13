@@ -35,15 +35,21 @@ pub trait Dvd: Send {
 
     fn read_raw_disc(&self, offset: usize, buf: &mut [u8]);
 
-    fn tmd_body_offset(&self) -> usize {
+    /// Returns the data partition's TMD `(size, absolute body offset)`.
+    fn tmd_descriptor(&self) -> (u32, usize) {
         let partition_offset = self.data_partition_offset() as usize;
 
-        // Partition header layout: ticket at +0, TMD descriptor at +0x2A4.
-        // We only need the TMD offset field (>>2).
+        // Partition header layout: ticket at +0, TMD descriptor at +0x2A4:
+        // size, then offset (>>2).
         let mut tmd_descriptor = [0u8; 8];
         self.read_raw_disc(partition_offset + dvd::PARTITION_TMD_SIZE_OFFSET, &mut tmd_descriptor);
+        let size = u32::from_be_bytes(tmd_descriptor[0..4].try_into().unwrap());
         let tmd_offset_field = u32::from_be_bytes(tmd_descriptor[4..8].try_into().unwrap());
-        partition_offset + ((tmd_offset_field as usize) << 2)
+        (size, partition_offset + ((tmd_offset_field as usize) << 2))
+    }
+
+    fn tmd_body_offset(&self) -> usize {
+        self.tmd_descriptor().1
     }
 
     fn tmd_ios_title_id(&self) -> u64 {

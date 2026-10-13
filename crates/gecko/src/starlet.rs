@@ -17,10 +17,14 @@ const ACK_TO_NEXT_DELAY_US: u64 = 100;
 
 const DEVICE_STATE_CAPACITY: usize = 256;
 
-pub struct PendingResponse {
-    pub cmd_paddr: u32,
-    pub result: i32,
+pub enum PendingResponse {
+    Reply { cmd_paddr: u32, result: i32 },
+    // A bare ACK without a reply, e.g. the second ACK of an IOS reload.
+    Ack,
 }
+
+// Savestate encoding of `PendingResponse::Ack`, never a real IPC result.
+const SAVED_ACK_RESULT: i32 = i32::MIN + 1;
 
 /// Backing storage for an open fd. Control devices share state across fds via
 /// a path key into the registry; host backed files own their device instance
@@ -181,6 +185,27 @@ impl Starlet {
 }
 
 impl System<{ crate::WII }> {
+    fn reload_ios(&mut self, imv: &crate::wii::ios::MemoryValues) {
+        // Refresh IOS memory without rerunning the disc boot
+        // setup, which would overwrite the running loader's state.
+        Self::write_ios_low_memory(self, imv);
+
+        self.scheduler.cancel(crate::scheduler::Handler::IpcDeliver);
+
+        let fs_root = self.starlet.host_fs_root.clone();
+        let sysconf = self.starlet.devices.remove("/shared2/sys/SYSCONF");
+        self.starlet = Starlet::new();
+        self.starlet.host_fs_root = fs_root;
+
+        self.initialize_starlet_devices();
+
+        if let Some(sysconf) = sysconf {
+            self.starlet.register("/shared2/sys/SYSCONF", sysconf);
+        }
+
+        tracing::debug!(ios = imv.ios_number, "IOS reloaded");
+    }
+
     pub fn initialize_starlet_devices(&mut self) {
         use crate::hollywood::ipc::{self, stm};
 
@@ -214,19 +239,38 @@ impl System<{ crate::WII }> {
                 di: &mut self.di,
                 pi: &mut self.pi,
                 device_path: "<unbound>".to_owned(),
+                reload_ios: None,
             },
         )
     }
 }
 
 pub fn dispatch_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd_paddr: u32) {
-    let result = self::process_command(sys, cmd_paddr);
-    if result == crate::hollywood::ipc::IPC_HUNG {
-        crate::hollywood::ipc::deliver_ack(sys);
+    assert!(SYSTEM == crate::WII, "Starlet dispatch reached on non-Wii system");
+
+    let wii: &mut crate::Wii = unsafe { ::core::mem::transmute(sys) };
+
+    let (result, reload_ios) = self::process_command(wii, cmd_paddr);
+    if let Some(imv) = reload_ios {
+        crate::hollywood::ipc::deliver_ack(wii);
+        wii.reload_ios(imv);
+        // libogc's relaunch request waits for two ACKs. Queue the second one separately so the PPC can observe and
+        // clear the first.
+        wii.starlet.pending.push_back(PendingResponse::Ack);
+        self::ensure_delivery_scheduled(wii, ACK_TO_NEXT_DELAY_US);
         return;
     }
-    sys.starlet.pending.push_back(PendingResponse { cmd_paddr, result });
-    self::ensure_delivery_scheduled::<SYSTEM>(sys, FINALIZE_DELAY_US);
+
+    if result == crate::hollywood::ipc::IPC_HUNG {
+        crate::hollywood::ipc::deliver_ack(wii);
+        return;
+    }
+
+    wii.starlet
+        .pending
+        .push_back(PendingResponse::Reply { cmd_paddr, result });
+
+    self::ensure_delivery_scheduled(wii, FINALIZE_DELAY_US);
 }
 
 pub fn schedule_drain<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
@@ -253,13 +297,10 @@ const IOS_SEEK: u32 = 5;
 const IOS_IOCTL: u32 = 6;
 const IOS_IOCTLV: u32 = 7;
 
-fn process_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd_paddr: u32) -> i32 {
+fn process_command(wii: &mut crate::Wii, cmd_paddr: u32) -> (i32, Option<&'static crate::wii::ios::MemoryValues>) {
     use crate::hollywood::ipc::fs::FS_ENOENT;
     use crate::hollywood::ipc::{IPC_EINVAL, IPC_ENOENT};
 
-    assert!(SYSTEM == crate::WII, "Starlet dispatch reached on non-Wii system");
-
-    let wii: &mut crate::Wii = unsafe { ::core::mem::transmute(sys) };
     let cmd = wii.mmio.phys_read_u32(cmd_paddr);
     let fd = wii.mmio.phys_read_u32(cmd_paddr + 0x08) as i32;
 
@@ -267,7 +308,7 @@ fn process_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd_paddr: 
 
     let (starlet, mut ctx) = wii.create_device_context();
 
-    match cmd {
+    let result = match cmd {
         IOS_OPEN => {
             let path_ptr = ctx.mmio.phys_read_u32(cmd_paddr + 0x0C);
             let mode = ctx.mmio.phys_read_u32(cmd_paddr + 0x10);
@@ -393,7 +434,9 @@ fn process_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd_paddr: 
             tracing::error!(cmd = other, "unimplemented IOS command");
             IPC_EINVAL
         }
-    }
+    };
+
+    (result, ctx.reload_ios)
 }
 
 fn sync_ios_buffers(wii: &mut crate::Wii, cmd_paddr: u32, cmd: u32) {
@@ -456,10 +499,15 @@ fn bind_fd_context(starlet: &Starlet, ctx: &mut DeviceContext<'_>, fd: i32) -> S
 pub(crate) fn deliver_pending<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     sys.starlet.delivery_scheduled = false;
 
-    if sys.hollywood.ipc.ppcctrl.arm_response() {
+    let ppcctrl = &sys.hollywood.ipc.ppcctrl;
+    let busy = match sys.starlet.pending.front() {
+        Some(PendingResponse::Ack) => ppcctrl.arm_response() || ppcctrl.arm_post_ack(),
+        _ => ppcctrl.arm_response(),
+    };
+    if busy {
         tracing::trace!(
             queue_len = sys.starlet.pending.len(),
-            "deliver_pending: arm_response still set, skipping"
+            "deliver_pending: waiting for PPC to consume the previous IPC signal"
         );
 
         if !sys.starlet.pending.is_empty() {
@@ -474,14 +522,21 @@ pub(crate) fn deliver_pending<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) 
         return;
     };
 
-    tracing::trace!(
-        cmd_paddr = format!("{:#010X}", p.cmd_paddr),
-        result = p.result,
-        remaining = sys.starlet.pending.len(),
-        "deliver_pending"
-    );
-
-    crate::hollywood::ipc::deliver_response(sys, p.cmd_paddr, p.result);
+    match p {
+        PendingResponse::Reply { cmd_paddr, result } => {
+            tracing::trace!(
+                cmd_paddr = format!("{cmd_paddr:#010X}"),
+                result,
+                remaining = sys.starlet.pending.len(),
+                "deliver_pending"
+            );
+            crate::hollywood::ipc::deliver_response(sys, cmd_paddr, result);
+        }
+        PendingResponse::Ack => {
+            tracing::trace!(remaining = sys.starlet.pending.len(), "deliver_pending: ack");
+            crate::hollywood::ipc::deliver_ack(sys);
+        }
+    }
 
     if !sys.starlet.pending.is_empty() {
         self::ensure_delivery_scheduled::<SYSTEM>(sys, ACK_TO_NEXT_DELAY_US);
@@ -495,8 +550,12 @@ impl Starlet {
 
         w.u32(self.pending.len() as u32);
         for response in &self.pending {
-            w.u32(response.cmd_paddr);
-            w.i32(response.result);
+            let (cmd_paddr, result) = match *response {
+                PendingResponse::Reply { cmd_paddr, result } => (cmd_paddr, result),
+                PendingResponse::Ack => (0, SAVED_ACK_RESULT),
+            };
+            w.u32(cmd_paddr);
+            w.i32(result);
         }
 
         let mut devices: Vec<_> = self.devices.iter_mut().collect();
@@ -544,9 +603,10 @@ impl Starlet {
         self.pending.clear();
         let pending_count = r.u32()?;
         for _ in 0..pending_count {
-            self.pending.push_back(PendingResponse {
-                cmd_paddr: r.u32()?,
-                result: r.i32()?,
+            let (cmd_paddr, result) = (r.u32()?, r.i32()?);
+            self.pending.push_back(match result {
+                SAVED_ACK_RESULT => PendingResponse::Ack,
+                _ => PendingResponse::Reply { cmd_paddr, result },
             });
         }
 
