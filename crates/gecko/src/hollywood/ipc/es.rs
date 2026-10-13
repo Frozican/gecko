@@ -2,6 +2,7 @@ use image::dvd::PARTITION_TMD_SIZE_OFFSET;
 
 use crate::hollywood::ipc::IosDevice;
 
+pub const IOCTL_GET_NUM_TICKET_VIEWS: u32 = 0x12;
 pub const IOCTL_GET_CONSUMPTION: u32 = 0x16;
 pub const IOCTL_DI_GET_TICKET_VIEW: u32 = 0x1B;
 pub const IOCTL_GET_DATA_DIR: u32 = 0x1D;
@@ -25,6 +26,28 @@ impl IosDevice for ETicketServices {
         vec_ptr: u32,
     ) -> i32 {
         match cmd {
+            IOCTL_GET_NUM_TICKET_VIEWS => {
+                if in_count != 1 || io_count != 1 {
+                    return ES_EINVAL;
+                }
+                if ctx.mmio.phys_read_u32(vec_ptr + 4) != 8 || ctx.mmio.phys_read_u32(vec_ptr + 12) != 4 {
+                    return ES_EINVAL;
+                }
+
+                let in_buf = ctx.mmio.phys_read_u32(vec_ptr);
+                let title_id =
+                    ((ctx.mmio.phys_read_u32(in_buf) as u64) << 32) | ctx.mmio.phys_read_u32(in_buf + 4) as u64;
+                let out_buf = ctx.mmio.phys_read_u32(vec_ptr + 8);
+
+                let ios_number = title_id as u32;
+                let available =
+                    title_id >> 32 == 1 && ios_number < 0x100 && crate::wii::ios::for_ios(ios_number as u16).is_some();
+                let count = available as u32;
+                ctx.mmio.phys_write_u32(out_buf, count);
+
+                tracing::debug!(title_id = format!("{title_id:016X}"), count, "ES_GetNumTicketViews");
+                0
+            }
             IOCTL_GET_TITLE_ID => {
                 if in_count != 0 || io_count != 1 {
                     tracing::warn!(in_count, io_count, "ES_GetTitleID: unexpected vector counts");

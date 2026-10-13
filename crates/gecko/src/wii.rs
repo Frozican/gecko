@@ -1,4 +1,4 @@
-mod ios;
+pub(crate) mod ios;
 
 use crate::scheduler::Scheduler;
 use crate::system::{System, WII};
