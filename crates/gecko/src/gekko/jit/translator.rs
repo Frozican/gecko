@@ -292,7 +292,7 @@ pub(crate) fn translate<const SYSTEM: SystemId>(
         let new_cyc = builder.ins().iadd(cyc_val, cyc_delta);
         builder.ins().store(vmctx_flags(), new_cyc, ctx_ptr, cyc_off);
 
-        let final_nia = builder.ins().iconst(types::I32, spec.start_pc.wrapping_add(12) as i64);
+        let final_nia = builder.ins().iconst(types::I32, spec.end_pc() as i64);
 
         if let Some(slot_addr) = chain_fall_addr {
             emit_chain_or_exit::<SYSTEM>(

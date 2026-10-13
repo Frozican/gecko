@@ -65,7 +65,7 @@ fn classify_pointer_iter_loop(spec: &BlockSpec) -> Option<IdleClass> {
     if bo & 0b00010 != 0 {
         return None;
     }
-    let branch_pc = spec.start_pc.wrapping_add(8);
+    let branch_pc = spec.pc_of(2);
     let target = if i2.aa() {
         i2.bd() as u32
     } else {
@@ -103,7 +103,7 @@ fn classify_branch_to_self(spec: &BlockSpec) -> Option<IdleClass> {
     let target = if instr.aa() {
         li as u32
     } else {
-        spec.start_pc.wrapping_add_signed(li)
+        spec.pc_of(0).wrapping_add_signed(li)
     };
 
     if target == spec.start_pc {
@@ -130,7 +130,8 @@ fn classify_polling_loop(spec: &BlockSpec) -> bool {
     }
 
     let term = crate::gekko::instruction::Instruction(spec.instrs[last_idx]);
-    let term_pc = spec.start_pc.wrapping_add((last_idx as u32) * 4);
+    // Forward branches can be folded out, so instruction PCs need not be contiguous.
+    let term_pc = spec.pc_of(last_idx);
     if !is_idle_loop_terminator(term, term_pc, spec.start_pc) {
         return false;
     }

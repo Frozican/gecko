@@ -913,7 +913,7 @@ impl<const SYSTEM: SystemId> JitEngine<SYSTEM> {
 
                 if let Some(spec) = self.block_specs.get(pc) {
                     for (i, &raw) in spec.instrs.iter().enumerate() {
-                        let ipc = spec.start_pc.wrapping_add((i as u32) * 4);
+                        let ipc = spec.pc_of(i);
                         let text = decode_gekko_instr(raw);
                         writeln!(dfile, "  {:08X}  {:08X}  {}", ipc, raw, text)?;
                     }
@@ -1290,7 +1290,7 @@ fn looks_like_polling_shape(spec: &block::BlockSpec, body_cap: usize) -> bool {
     let aa = (raw >> 1) & 1 != 0;
     let bd = (((raw >> 2) & 0x3FFF) as i32) << 18 >> 18;
     let bd_bytes = bd << 2;
-    let term_pc = spec.start_pc.wrapping_add((last_idx as u32) * 4);
+    let term_pc = spec.pc_of(last_idx);
     let target = if aa {
         bd_bytes as u32
     } else {
