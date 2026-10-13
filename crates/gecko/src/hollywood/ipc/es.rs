@@ -8,6 +8,7 @@ pub const IOCTL_DI_GET_TICKET_VIEW: u32 = 0x1B;
 pub const IOCTL_GET_DATA_DIR: u32 = 0x1D;
 pub const IOCTL_GET_TITLE_ID: u32 = 0x20;
 pub const IOCTL_DI_GET_TMD_SIZE: u32 = 0x39;
+pub const IOCTL_DI_GET_TMD: u32 = 0x3A;
 
 pub const ES_EINVAL: i32 = -1017;
 pub const ES_ENOMEM: i32 = -1024;
@@ -139,6 +140,47 @@ impl IosDevice for ETicketServices {
                 let out_buf = ctx.mmio.phys_read_u32(vec_ptr);
                 ctx.mmio.phys_write_u32(out_buf, size);
 
+                0
+            }
+            IOCTL_DI_GET_TMD => {
+                if in_count != 1 || io_count != 1 {
+                    return ES_EINVAL;
+                }
+                if ctx.mmio.phys_read_u32(vec_ptr + 4) != 4 {
+                    return ES_EINVAL;
+                }
+
+                let in_buf = ctx.mmio.phys_read_u32(vec_ptr);
+                let requested_size = ctx.mmio.phys_read_u32(in_buf);
+                let out_buf = ctx.mmio.phys_read_u32(vec_ptr + 8);
+                let out_len = ctx.mmio.phys_read_u32(vec_ptr + 12);
+                if requested_size != out_len {
+                    return ES_EINVAL;
+                }
+
+                let Some(dvd) = ctx.di.dvd.as_ref() else {
+                    return ES_EINVAL;
+                };
+
+                let tmd_size_addr = dvd.data_partition_offset() as usize + PARTITION_TMD_SIZE_OFFSET;
+
+                let mut size = [0u8; 4];
+                dvd.read_raw_disc(tmd_size_addr, &mut size);
+                let size = u32::from_be_bytes(size);
+
+                if out_len < size {
+                    return ES_EINVAL;
+                }
+
+                let tmd_addr = dvd.tmd_body_offset();
+                dvd.read_raw_disc(tmd_addr, ctx.mmio.phys_slice_mut(out_buf, size as usize));
+
+                tracing::debug!(
+                    addr = format!("{tmd_addr:#010X}"),
+                    size,
+                    out_buf = format!("{out_buf:#010X}"),
+                    "ES_DIGetTmd"
+                );
                 0
             }
             _ => {
