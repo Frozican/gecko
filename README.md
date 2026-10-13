@@ -432,7 +432,7 @@ Features below are listed based on the frontend crate that supports them. Most o
 </details>
 
 ## Why?
-Why do we get a new Wii emulator? Well, it all started a few years ago. I wanted to do something nostalgic and as a kid I spent countless hour in this one Wii game called *Final Fantasy Crystal Chronicals: The Crystal Bearers*. It wasn't a well received game but I loved it so much, I chose my online persona "Layle" after the main protagonist. I figured it would be cool to spend some years learning about emulation development with the goal to eventually run the game in my own emulator!
+Why do we get a new Wii emulator? Well, it all started a few years ago. I wanted to do something nostalgic and as a kid I spent countless hours playing one Wii game in particular: *Final Fantasy Crystal Chronicles: The Crystal Bearers*. I think it wasn't a well received game, but I loved it so much that I named the username I usually go by, "Layle", after its main protagonist. I figured it would be cool to spend a few years learning about emulator development, with the goal of eventually running the game in my own emulator!
 
 ## Sister Projects
 Gecko is being developed alongside other amazing emulators that shaped how Gecko came to be. Without them, Gecko wouldn't exist!
