@@ -36,13 +36,27 @@ impl IosDevice for ETicketServices {
                 }
 
                 let title_id = self::read_title_id(ctx, vec_ptr);
-                let Some(imv) = self::hle_ios(title_id) else {
-                    return super::fs::FS_ENOENT;
-                };
+                match TitleKind::of(title_id) {
+                    TitleKind::Ios(ios) => {
+                        let Some(imv) = crate::wii::ios::for_ios(ios) else {
+                            tracing::warn!(ios, "ES_LaunchTitle: no HLE values for IOS");
+                            return super::fs::FS_ENOENT;
+                        };
 
-                tracing::debug!(title_id = format!("{title_id:016X}"), "ES_LaunchTitle: reload IOS");
-                ctx.reload_ios = Some(imv);
-                0
+                        tracing::debug!(title_id = format!("{title_id:016X}"), "ES_LaunchTitle: reload IOS");
+                        ctx.reload_ios = Some(imv);
+                        0
+                    }
+                    kind @ (TitleKind::GameCube | TitleKind::Broadway) => {
+                        // These reset Broadway (lol thanks zayd) into another title, which needs installed titles we don't have.
+                        tracing::error!(
+                            title_id = format!("{title_id:016X}"),
+                            ?kind,
+                            "ES_LaunchTitle: unsupported title kind"
+                        );
+                        super::fs::FS_ENOENT
+                    }
+                }
             }
             IOCTL_GET_NUM_TICKET_VIEWS => {
                 if in_count != 1 || io_count != 1 || !super::vec_lens_match(ctx.mmio, vec_ptr, &[8, 4]) {
@@ -213,9 +227,31 @@ fn read_title_id(ctx: &super::DeviceContext<'_>, vec_ptr: u32) -> u64 {
 }
 
 fn hle_ios(title_id: u64) -> Option<&'static MemoryValues> {
-    let ios_number = title_id as u32;
-    if title_id >> 32 != 1 || ios_number >= 0x100 {
-        return None;
+    match TitleKind::of(title_id) {
+        TitleKind::Ios(ios) => crate::wii::ios::for_ios(ios),
+        _ => None,
     }
-    crate::wii::ios::for_ios(ios_number as u16)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleKind {
+    Ios(u16),
+    GameCube,
+    Broadway,
+}
+
+impl TitleKind {
+    const SYSTEM: u32 = 0x0000_0001;
+    const SYSTEM_MENU: u32 = 0x0000_0002;
+    const BC: u32 = 0x0000_0100;
+    const MIOS: u32 = 0x0000_0101;
+
+    fn of(title_id: u64) -> Self {
+        match ((title_id >> 32) as u32, title_id as u32) {
+            (Self::SYSTEM, Self::SYSTEM_MENU) => Self::Broadway,
+            (Self::SYSTEM, Self::BC | Self::MIOS) => Self::GameCube,
+            (Self::SYSTEM, ios @ 0x03..=0xFF) => Self::Ios(ios as u16),
+            _ => Self::Broadway,
+        }
+    }
 }
