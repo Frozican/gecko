@@ -1,9 +1,12 @@
+use image::dvd::PARTITION_TMD_SIZE_OFFSET;
+
 use crate::hollywood::ipc::IosDevice;
 
 pub const IOCTL_GET_CONSUMPTION: u32 = 0x16;
 pub const IOCTL_DI_GET_TICKET_VIEW: u32 = 0x1B;
 pub const IOCTL_GET_DATA_DIR: u32 = 0x1D;
 pub const IOCTL_GET_TITLE_ID: u32 = 0x20;
+pub const IOCTL_DI_GET_TMD_SIZE: u32 = 0x39;
 
 pub const ES_EINVAL: i32 = -1017;
 pub const ES_ENOMEM: i32 = -1024;
@@ -89,6 +92,30 @@ impl IosDevice for ETicketServices {
                     out_buf = format!("{out_buf:#010X}"),
                     "ES_GetDataDir"
                 );
+                0
+            }
+            IOCTL_DI_GET_TMD_SIZE => {
+                if in_count != 0 || io_count != 1 {
+                    return ES_EINVAL;
+                }
+                if ctx.mmio.phys_read_u32(vec_ptr + 4) != 4 {
+                    return ES_EINVAL;
+                }
+                let Some(dvd) = ctx.di.dvd.as_ref() else {
+                    return ES_EINVAL;
+                };
+
+                let tmd_size_addr = dvd.data_partition_offset() as usize + PARTITION_TMD_SIZE_OFFSET;
+
+                let mut size = [0u8; 4];
+                dvd.read_raw_disc(tmd_size_addr, &mut size);
+                let size = u32::from_be_bytes(size);
+
+                tracing::debug!(addr = format!("{:#010X}", tmd_size_addr), size, "ES_DIGetTmdSize");
+
+                let out_buf = ctx.mmio.phys_read_u32(vec_ptr);
+                ctx.mmio.phys_write_u32(out_buf, size);
+
                 0
             }
             _ => {
