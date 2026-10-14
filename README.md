@@ -18,7 +18,7 @@ Gecko is still in development but has reached a state where most games I tested 
 - [Wii](https://emu.layle.dev/gecko-wii)
 
 > [!NOTE]
-> Not all games are tracked and are infrequently updated! The screenshot service makes a best effort attempt to enter games by pressing random buttons. Just because a game doesn't go ingame, doesn't mean it actually doesn't.
+> Not all games are tracked and they are only infrequently updated! The screenshot service makes a best effort attempt to enter games by pressing random buttons. Just because a game doesn't go ingame, doesn't mean it actually doesn't.
 
 Gecko now also has a [**community driven** compatibility database](https://gecko.layle.dev/compat)! Feel free to leave a vote when trying out games. The database is still new, so please take the ratings with a grain of salt!
 
