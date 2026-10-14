@@ -1,7 +1,7 @@
 import super::common::{FrameUniforms, DrawUniforms, VsIn, VsOut, frame, draw, tex0, tex1, tex2, tex3, tex4, tex5, tex6, tex7, samp0, samp1, samp2, samp3, samp4, samp5, samp6, samp7};
-import super::tev_helpers::{extract_bits, select_texcoord, stq_to_uv, sample_texmap, swizzle_tev_color, tev_color_in, tev_alpha_in};
-import super::tev_indirect::{IndirectSamples, IndirectResult, sample_indirect_textures, apply_indirect, texmap_size};
-import super::tev_combiners::{tev_combine_color, tev_combine_alpha};
+import super::tev_helpers::{extract_bits, select_texcoord, texmap_size, texmap_uv, sample_texmap, swizzle_tev_color, tev_color_in, tev_alpha_in};
+import super::tev_indirect::{IndirectSamples, IndirectResult, sample_indirect_textures, apply_indirect};
+import super::tev_combiners::{tev_combine_color, tev_combine_alpha, tev_wrap_rgb, tev_wrap_alpha};
 import super::alpha_test::{alpha_compare, alpha_combine};
 import super::lighting::{compute_lighting_c0, compute_lighting_c1};
 
@@ -114,11 +114,19 @@ fn dynamic_tev_indirect(stage: u32) -> u32 {
     return frame.tev_indirect[stage / 4u][stage % 4u];
 }
 
+fn color_texgen(slot: u32, regular: vec3<f32>, color0: vec4<f32>, color1: vec4<f32>) -> vec3<f32> {
+    switch extract_bits(frame.texgen_types, slot * 3u, 3u) {
+        case 2u: { return vec3(color0.rg, 1.0); }
+        case 3u: { return vec3(color1.rg, 1.0); }
+        default: { return regular; }
+    }
+}
+
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = draw.mvp * vec4<f32>(in.pos_view, 1.0);
-    out.clip_pos.z = out.clip_pos.z + out.clip_pos.w;
+    out.clip_pos.z = -out.clip_pos.z;
     out.color = compute_lighting_c0(
         shader_state(gx_color_ctrl_0, frame.color_ctrl0),
         shader_state(gx_alpha_ctrl_0, frame.alpha_ctrl0),
@@ -132,14 +140,14 @@ fn vs_main(in: VsIn) -> VsOut {
         in.color1, in.normal, in.pos_view,
     );
 
-    @if(TEXCOORD_0_ENABLED) { out.uv0 = in.tex0; } @else { out.uv0 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_1_ENABLED) { out.uv1 = in.tex1; } @else { out.uv1 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_2_ENABLED) { out.uv2 = in.tex2; } @else { out.uv2 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_3_ENABLED) { out.uv3 = in.tex3; } @else { out.uv3 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_4_ENABLED) { out.uv4 = in.tex4; } @else { out.uv4 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_5_ENABLED) { out.uv5 = in.tex5; } @else { out.uv5 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_6_ENABLED) { out.uv6 = in.tex6; } @else { out.uv6 = vec3<f32>(0.0, 0.0, 1.0); }
-    @if(TEXCOORD_7_ENABLED) { out.uv7 = in.tex7; } @else { out.uv7 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_0_ENABLED) { out.uv0 = color_texgen(0u, in.tex0, out.color, out.color1); } @else { out.uv0 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_1_ENABLED) { out.uv1 = color_texgen(1u, in.tex1, out.color, out.color1); } @else { out.uv1 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_2_ENABLED) { out.uv2 = color_texgen(2u, in.tex2, out.color, out.color1); } @else { out.uv2 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_3_ENABLED) { out.uv3 = color_texgen(3u, in.tex3, out.color, out.color1); } @else { out.uv3 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_4_ENABLED) { out.uv4 = color_texgen(4u, in.tex4, out.color, out.color1); } @else { out.uv4 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_5_ENABLED) { out.uv5 = color_texgen(5u, in.tex5, out.color, out.color1); } @else { out.uv5 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_6_ENABLED) { out.uv6 = color_texgen(6u, in.tex6, out.color, out.color1); } @else { out.uv6 = vec3<f32>(0.0, 0.0, 1.0); }
+    @if(TEXCOORD_7_ENABLED) { out.uv7 = color_texgen(7u, in.tex7, out.color, out.color1); } @else { out.uv7 = vec3<f32>(0.0, 0.0, 1.0); }
     
     return out;
 }
@@ -150,7 +158,7 @@ struct TevState {
     last_color_dest: u32,
     last_alpha_dest: u32,
     // Raw (pre-swap-table) texel of the last TEV stage that sampled a
-    // texture. Feeds the Z-texture value in fs_main_ztex (hardware: the
+    // texture. Feeds the Z-texture value in fs_main_depth (hardware: the
     // PE's RawTexColor latch).
     last_raw_tex: vec4<f32>,
 }
@@ -187,8 +195,8 @@ fn run_stage(
     let ras_channel = (order >> 7u) & 7u;
 
     let stq = select_texcoord(in, texcoord_idx);
-    let direct_uv = stq_to_uv(stq);
     let direct_size = texmap_size(texmap_idx);
+    let direct_uv = texmap_uv(stq, texcoord_idx, direct_size);
     let indirect = apply_indirect(ind_cmd, direct_uv, direct_size, presampled, (*state).running_uv);
     (*state).running_uv = indirect.uv;
 
@@ -237,9 +245,9 @@ fn run_stage(
 
     let konst_color = frame.tev_konst_colors[stage];
 
-    let in_a = tev_color_in(c_a, tex_color, ras_color, (*state).regs, konst_color);
-    let in_b = tev_color_in(c_b, tex_color, ras_color, (*state).regs, konst_color);
-    let in_c = tev_color_in(c_c, tex_color, ras_color, (*state).regs, konst_color);
+    let in_a = tev_wrap_rgb(tev_color_in(c_a, tex_color, ras_color, (*state).regs, konst_color));
+    let in_b = tev_wrap_rgb(tev_color_in(c_b, tex_color, ras_color, (*state).regs, konst_color));
+    let in_c = tev_wrap_rgb(tev_color_in(c_c, tex_color, ras_color, (*state).regs, konst_color));
     let in_d = tev_color_in(c_d, tex_color, ras_color, (*state).regs, konst_color);
 
     let color_result = tev_combine_color(in_a, in_b, in_c, in_d, c_bias, c_sub, c_scale, c_clamp);
@@ -255,9 +263,9 @@ fn run_stage(
     let a_scale = extract_bits(aenv, 20u, 2u);
     let a_dest = extract_bits(aenv, 22u, 2u);
 
-    let ain_a = tev_alpha_in(a_a, tex_color, ras_color, (*state).regs, konst_color);
-    let ain_b = tev_alpha_in(a_b, tex_color, ras_color, (*state).regs, konst_color);
-    let ain_c = tev_alpha_in(a_c, tex_color, ras_color, (*state).regs, konst_color);
+    let ain_a = tev_wrap_alpha(tev_alpha_in(a_a, tex_color, ras_color, (*state).regs, konst_color));
+    let ain_b = tev_wrap_alpha(tev_alpha_in(a_b, tex_color, ras_color, (*state).regs, konst_color));
+    let ain_c = tev_wrap_alpha(tev_alpha_in(a_c, tex_color, ras_color, (*state).regs, konst_color));
     let ain_d = tev_alpha_in(a_d, tex_color, ras_color, (*state).regs, konst_color);
 
     let alpha_result = tev_combine_alpha(ain_a, ain_b, ain_c, ain_d, in_a, in_b, a_bias, a_sub, a_scale, a_clamp);
@@ -303,7 +311,10 @@ fn run_tev(in: VsOut) -> TevResult {
     @if(TEV_STAGE_15_ENABLED) { run_stage(14u, shader_state(gx_tev_order_14, dynamic_tev_order(14u)), shader_state(gx_tev_color_env_14, dynamic_tev_color_env(14u)), shader_state(gx_tev_alpha_env_14, dynamic_tev_alpha_env(14u)), shader_state(gx_tev_indirect_14, dynamic_tev_indirect(14u)), in, color0, presampled, &state); }
     @if(TEV_STAGE_16_ENABLED) { run_stage(15u, shader_state(gx_tev_order_15, dynamic_tev_order(15u)), shader_state(gx_tev_color_env_15, dynamic_tev_color_env(15u)), shader_state(gx_tev_alpha_env_15, dynamic_tev_alpha_env(15u)), shader_state(gx_tev_indirect_15, dynamic_tev_indirect(15u)), in, color0, presampled, &state); }
 
-    let color = vec4<f32>(state.regs[state.last_color_dest].rgb, state.regs[state.last_alpha_dest].a);
+    let color = vec4<f32>(
+        tev_wrap_rgb(state.regs[state.last_color_dest].rgb),
+        tev_wrap_alpha(state.regs[state.last_alpha_dest].a),
+    );
 
     @if(ALPHA_TEST_ENABLED) {
         let c0 = alpha_compare(color.a, frame.alpha_ref0, shader_state(gx_alpha_comp_0, frame.alpha_comp0));
@@ -324,28 +335,70 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return run_tev(in).color;
 }
 
-struct FsOutZtex {
+struct FsOutDepth {
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
 }
 
-@fragment
-fn fs_main_ztex(in: VsOut) -> FsOutZtex {
-    let r = run_tev(in);
-    let texel = vec4<u32>(round(r.raw_tex * 255.0));
-    var z: u32 = frame.ztex_bias;
-    switch shader_state(gx_ztex_type, frame.ztex_type) {
-        case 0u: { z += texel.a; }
-        case 1u: { z += (texel.a << 8u) | texel.r; }
-        default: { z += (texel.r << 16u) | (texel.g << 8u) | texel.b; }
-    }
-    if shader_state(gx_ztex_op, frame.ztex_op) == 1u {
-        z += u32(round(in.clip_pos.z * 16777215.0));
-    }
-    z = z & 0x00FFFFFFu;
+// Hardware readbacks are consistent with a signed 27bit depth field! The
+// frozen plane value wraps into -2^26 through 2^26 - 1 before saturating to Z24.
+// Unsure if this is true, it seems we'd have to ask the crackhead engineer who designed this.
+// Thanks @hazel for testing on hardware :D
+fn zfreeze_depth(z: f32) -> f32 {
+    return clamp(z - floor(z / 134217728.0 + 0.5) * 134217728.0, 0.0, 16777215.0);
+}
 
-    var out_: FsOutZtex;
+fn shade_depth(in: VsOut) -> FsOutDepth {
+    let r = run_tev(in);
+    var depth = in.clip_pos.z;
+    var z24 = round((1.0 - depth) * 16777215.0);
+
+    // W enables Z-freeze. XYZ stores the saved plane's A, B, C coeffs.
+    // Evaluate the plane, wrap its signed depth result, then clamp to Z24.
+    // Divide by 2^24 and reverse for host depth (near = 1).
+    if frame.zfreeze_plane.w != 0.0 {
+        z24 = zfreeze_depth(dot(frame.zfreeze_plane.xyz, vec3<f32>(in.clip_pos.xy, 1.0)));
+        depth = 1.0 - z24 / 16777216.0;
+    }
+
+    let op = shader_state(gx_ztex_op, frame.ztex_op);
+    if op != 0u {
+        let texel = vec4<u32>(round(r.raw_tex * 255.0));
+        var z: u32 = frame.ztex_bias;
+        switch shader_state(gx_ztex_type, frame.ztex_type) {
+            case 0u: { z += texel.a; }
+            case 1u: { z += (texel.a << 8u) | texel.r; }
+            default: { z += (texel.r << 16u) | (texel.g << 8u) | texel.b; }
+        }
+        if op == 1u { z += u32(round(z24)); }
+        z = z & 0x00FFFFFFu;
+        depth = 1.0 - f32(z) / 16777215.0;
+    }
+
+    var out_: FsOutDepth;
     out_.color = r.color;
-    out_.depth = f32(z) / 16777215.0;
+    out_.depth = depth;
     return out_;
+}
+
+@fragment
+fn fs_main_depth(in: VsOut) -> FsOutDepth {
+    return shade_depth(in);
+}
+
+fn stored_alpha() -> f32 {
+    return f32(frame.dst_alpha >> 2u) / 63.0;
+}
+
+@fragment
+fn fs_main_alpha(in: VsOut) -> @location(0) vec4<f32> {
+    let r = run_tev(in);
+    return vec4<f32>(r.color.rgb, stored_alpha());
+}
+
+@fragment
+fn fs_main_depth_alpha(in: VsOut) -> FsOutDepth {
+    var r = shade_depth(in);
+    r.color.a = stored_alpha();
+    return r;
 }

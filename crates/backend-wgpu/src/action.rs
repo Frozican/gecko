@@ -1,11 +1,11 @@
 use crate::pipeline::{FullPipelineKey, PipelineKey, UberPipelineKey};
 use crate::shader_specialization::{self, ShaderKey, ShaderSpecializationKey};
 use crate::{
-    BindGroupCacheKey, DRAW_UNIFORMS_SIZE, DrawUniforms, FRAME_UNIFORMS_SIZE, FrameUniforms, GxRenderer, SamplerKey,
-    helpers,
+    BindGroupCacheKey, CachedTexture, DRAW_UNIFORMS_SIZE, DrawUniforms, FRAME_UNIFORMS_SIZE, FrameUniforms, GxRenderer,
+    SamplerKey, helpers,
 };
 use gecko::flipper::gx::draw::Primitive;
-use gecko::flipper::gx::regs::{CullMode, MagFilter, MinFilter, WrapMode};
+use gecko::flipper::gx::regs::CullMode;
 use gecko::host::{DrawSegment, DrawState, GxAction};
 use glam::{Mat4, UVec4, Vec4};
 #[cfg(feature = "gx-stats")]
@@ -60,7 +60,11 @@ fn pack_u32_slice_to_uvec4x4(data: &[u32]) -> [UVec4; 4] {
     ]
 }
 
-fn build_frame_uniform(draw: &DrawState, alpha_cmp: gecko::flipper::gx::regs::AlphaCompare) -> FrameUniforms {
+fn build_frame_uniform(
+    draw: &DrawState,
+    alpha_cmp: gecko::flipper::gx::regs::AlphaCompare,
+    efb_scale: u32,
+) -> FrameUniforms {
     FrameUniforms {
         tev_color_regs: draw.tev_color_regs.map(Vec4::from),
         tev_konst_colors: draw.tev_konst_colors.map(Vec4::from),
@@ -80,7 +84,7 @@ fn build_frame_uniform(draw: &DrawState, alpha_cmp: gecko::flipper::gx::regs::Al
         indirect_refs: draw.indirect_refs,
         num_indirect_stages: draw.num_indirect_stages as u32,
         bump_imask: draw.bump_imask,
-        _pad1: 0,
+        texgen_types: draw.texgen_types,
         tev_indirect: pack_u32_slice_to_uvec4x4(&draw.tev_indirect),
         light_colors: draw.lights.each_ref().map(|l| Vec4::from(l.color)),
         light_cosatt: draw.lights.each_ref().map(|l| Vec4::from(l.cosatt)),
@@ -98,12 +102,16 @@ fn build_frame_uniform(draw: &DrawState, alpha_cmp: gecko::flipper::gx::regs::Al
         ztex_bias: draw.ztex_bias,
         ztex_type: draw.ztex_type as u32,
         ztex_op: draw.ztex_op as u32,
-        _pad2: 0,
+        dst_alpha: draw.dst_alpha.unwrap_or(0) as u32,
+        zfreeze_plane: draw.zfreeze.map_or(Vec4::ZERO, |p| {
+            Vec4::new(p.dx / efb_scale as f32, p.dy / efb_scale as f32, p.c, 1.0)
+        }),
+        texcoord_scales: pack_u32_slice_to_uvec4x4(&draw.texcoord_scales),
     }
 }
 
 impl GxRenderer {
-    fn current_pipeline_key(&self, ztex: bool) -> PipelineKey {
+    fn current_pipeline_key(&self, per_pixel_depth: bool) -> PipelineKey {
         let blend = self.current_blend_mode;
         let zmode = self.current_zmode;
         PipelineKey {
@@ -119,8 +127,41 @@ impl GxRenderer {
             color_update: blend.color_update(),
             alpha_update: blend.alpha_update(),
             cull_mode: self.current_cull_mode,
-            ztex,
+            per_pixel_depth,
+            dst_alpha: blend.alpha_update() && self.current_draw_state.dst_alpha.is_some(),
+            alpha_pass: false,
         }
+    }
+
+    fn ensure_pipeline(&mut self, device: &wgpu::Device, key: FullPipelineKey) {
+        if self.pipeline_cache.contains_key(&key) {
+            return;
+        }
+
+        let uber_key = UberPipelineKey::from(key);
+
+        if !self.uber_pipeline_cache.contains_key(&uber_key) {
+            #[cfg(feature = "gx-stats")]
+            let pipeline_started = std::time::Instant::now();
+            let module = &self.shader_cache[&key.shader];
+            let pipeline = crate::pipeline::create_uber_pipeline(
+                device,
+                &self.pipeline_layout,
+                self.surface_format,
+                module,
+                &uber_key,
+            );
+            self.uber_pipeline_cache.insert(uber_key, pipeline);
+            #[cfg(feature = "gx-stats")]
+            {
+                self.stats.pipelines_created.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .pipeline_create_cpu_ns
+                    .fetch_add(pipeline_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        }
+
+        self.request_specialized_pipeline(key);
     }
 
     /// Build a bind-group cache key from the current tracked textures.
@@ -135,7 +176,7 @@ impl GxRenderer {
     /// `previous`, rebasing the indices onto the merged vertex range.
     fn merge_into_previous(&mut self, previous: usize, draw: &DrawSegment) {
         let vertex_bias = self.scratch_draws[previous].vertex_count;
-        let (_, additional_indices) = self::emit_draw_indices(draw, &mut self.scratch_indices, vertex_bias);
+        let additional_indices = self::emit_draw_indices(draw, &mut self.scratch_indices, vertex_bias);
 
         let merged = &mut self.scratch_draws[previous];
         merged.vertex_count += draw.vertex_count;
@@ -228,7 +269,8 @@ impl GxRenderer {
                 width,
                 height,
                 fmt,
-                rgba,
+                mip_levels,
+                data,
             } => {
                 let tid = *id;
                 let copy_size = wgpu::Extent3d {
@@ -236,88 +278,184 @@ impl GxRenderer {
                     height: *height,
                     depth_or_array_layers: 1,
                 };
-                let direct_copy_layout = wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(*width * 4),
-                    rows_per_image: None,
-                };
 
                 let keep_cached = self
                     .efb_copy_cache
                     .get(&tid.ram_addr)
-                    .is_some_and(|e| e.matches(*fmt, *width, *height));
-                let reference_only = rgba.is_empty();
+                    .is_some_and(|e| *mip_levels == 1 && e.matches(*fmt, *width, *height));
+                let reference_only = data.is_none();
 
                 assert!(
                     !reference_only || keep_cached,
                     "pending EFB texture missing from renderer cache"
                 );
 
+                if !reference_only
+                    && self
+                        .draw_bg_keys
+                        .iter()
+                        .any(|k| k.tex_keys.iter().flatten().any(|t| t.ram_addr == tid.ram_addr))
+                {
+                    self.flush_draws_keep_vertices(device, queue);
+                }
                 if !keep_cached && let Some(entry) = self.efb_copy_cache.remove(&tid.ram_addr) {
                     self.return_to_pool(entry.texture, entry.view);
+                    self.bind_group_cache
+                        .retain(|key, _| !key.tex_keys.iter().flatten().any(|k| k.ram_addr == tid.ram_addr));
                 }
 
-                if let Some((_, cached_tex, _)) = self.texture_cache.get(&tid) {
-                    let size = cached_tex.size();
-                    if size.width == *width && size.height == *height {
-                        if !reference_only {
-                            let cached_tex = cached_tex.clone();
-                            let staged = self.stage_texture_upload(device, &cached_tex, rgba, *width, *height);
+                #[cfg(not(target_arch = "wasm32"))]
+                let replacement = match data {
+                    Some(data) if !keep_cached => self.texture_pack.lookup(device, queue, *width, *height, *fmt, data),
+                    _ => None,
+                };
+                #[cfg(target_arch = "wasm32")]
+                let replacement = None;
 
-                            if !staged {
-                                queue.write_texture(cached_tex.as_image_copy(), rgba, direct_copy_layout, copy_size);
+                let (tex, view) = match replacement {
+                    Some(replacement) => replacement,
+                    None => {
+                        if let Some(cached) = self.texture_cache.get_mut(&tid) {
+                            let size = cached.texture.size();
+                            if cached.texture.usage().contains(crate::LOAD_TEXTURE_USAGE)
+                                && size.width == *width
+                                && size.height == *height
+                                && cached.texture.mip_level_count() == *mip_levels
+                            {
+                                cached.fmt = *fmt;
+                                if let Some(data) = data {
+                                    let cached_tex = cached.texture.clone();
+                                    self.decode_texture_levels(device, queue, &cached_tex, *fmt, data);
+                                }
+
+                                return;
                             }
                         }
 
-                        if let Some((cached_fmt, _, _)) = self.texture_cache.get_mut(&tid) {
-                            *cached_fmt = *fmt;
+                        let pooled = self
+                            .texture_pool
+                            .get_mut(&(*width, *height, *mip_levels))
+                            .and_then(|v| v.pop());
+
+                        let tex = pooled.unwrap_or_else(|| {
+                            let texture_label = format!(
+                                "gx_tex addr={:#010x}/{:08x} fmt={:?} size={}x{}",
+                                id.ram_addr, id.variant, *fmt, *width, *height
+                            );
+                            device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some(&texture_label),
+                                size: copy_size,
+                                mip_level_count: *mip_levels,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::Rgba8Unorm,
+                                usage: crate::LOAD_TEXTURE_USAGE,
+                                view_formats: &[],
+                            })
+                        });
+
+                        if let Some(data) = data {
+                            self.decode_texture_levels(device, queue, &tex, *fmt, data);
                         }
-
-                        return;
+                        let view = tex.create_view(&Default::default());
+                        (tex, view)
                     }
+                };
+
+                if self.texture_cache.get(&tid).is_some_and(|cached| cached.texture == tex) {
+                    return;
                 }
-
-                let pooled = self.texture_pool.get_mut(&(*width, *height)).and_then(|v| v.pop());
-
-                let tex = pooled.unwrap_or_else(|| {
-                    let texture_label = format!(
-                        "gx_tex addr={:#010x}/{:08x} fmt={:?} size={}x{}",
-                        id.ram_addr, id.variant, *fmt, *width, *height
-                    );
-                    device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(&texture_label),
-                        size: copy_size,
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING
-                            | wgpu::TextureUsages::COPY_DST
-                            | wgpu::TextureUsages::COPY_SRC,
-                        view_formats: &[],
-                    })
-                });
-
-                if !reference_only {
-                    let staged = self.stage_texture_upload(device, &tex, rgba, *width, *height);
-
-                    if !staged {
-                        queue.write_texture(tex.as_image_copy(), rgba, direct_copy_layout, copy_size);
-                    }
-                }
-                let view = tex.create_view(&Default::default());
 
                 // Cached bind groups still hold the old TextureView for this
                 // key. Drop them so they get rebuilt against the new one.
                 self.bind_group_cache
-                    .retain(|key, _| !key.tex_keys.iter().any(|k| *k == Some(tid)));
+                    .retain(|key, _| !key.tex_keys.contains(&Some(tid)));
 
-                let prior = self.texture_cache.insert(tid, (*fmt, tex, view));
-                if let Some((_, old_tex, _)) = prior {
-                    self.return_load_texture_to_pool(old_tex);
+                let prior = self.texture_cache.insert(
+                    tid,
+                    CachedTexture {
+                        fmt: *fmt,
+                        native_w: *width,
+                        native_h: *height,
+                        texture: tex,
+                        view,
+                    },
+                );
+                if let Some(prior) = prior {
+                    self.return_load_texture_to_pool(prior.texture);
                 }
             }
-            GxAction::InvalidateCaches => {
+            GxAction::LoadEfbPalette {
+                id,
+                width,
+                height,
+                palette,
+            } => {
+                if self
+                    .draw_bg_keys
+                    .iter()
+                    .any(|k| k.tex_keys.iter().flatten().any(|t| t.ram_addr == id.ram_addr))
+                {
+                    self.flush_draws_keep_vertices(device, queue);
+                }
+
+                let entry = self.efb_copy_cache.get(&id.ram_addr).expect("missing palette EFB copy");
+                let source = entry
+                    .palette_source
+                    .as_ref()
+                    .expect("missing native EFB snapshot")
+                    .clone();
+                debug_assert_eq!((source.width(), source.height()), (*width, *height));
+
+                let existing = self.texture_cache.get(id).filter(|cached| {
+                    cached.texture.width() == *width
+                        && cached.texture.height() == *height
+                        && cached.texture.mip_level_count() == 1
+                        && cached.texture.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+                });
+
+                let (texture, view) = if let Some(cached) = existing {
+                    (cached.texture.clone(), cached.view.clone())
+                } else {
+                    if self.texture_cache.contains_key(id) {
+                        self.bind_group_cache
+                            .retain(|key, _| !key.tex_keys.contains(&Some(*id)));
+                    }
+                    let texture = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("efb_ci8_decoded"),
+                        size: wgpu::Extent3d {
+                            width: *width,
+                            height: *height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: crate::LOAD_TEXTURE_USAGE | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    });
+                    let view = texture.create_view(&Default::default());
+                    (texture, view)
+                };
+                let format = entry.format;
+
+                let mut encoder = self.take_or_create_encoder(device);
+                self.palette_converter
+                    .encode(device, queue, &mut encoder, &source, format, palette, &view);
+                self.current_encoder = Some(encoder);
+                self.texture_cache.insert(
+                    *id,
+                    CachedTexture {
+                        fmt: gecko::flipper::gx::draw::TextureFormat::CI8,
+                        native_w: *width,
+                        native_h: *height,
+                        texture,
+                        view,
+                    },
+                );
+            }
+            GxAction::InvalidateStateCaches | GxAction::InvalidateCaches => {
                 self.flush_pending_draws(device, queue);
                 let _ = self.submit_pending(queue);
                 self.texture_cache.clear();
@@ -326,7 +464,9 @@ impl GxRenderer {
                     self.return_to_pool(tex, view);
                 }
                 self.bind_group_cache.clear();
-                self.invalidate_pipeline_caches();
+                if matches!(action, GxAction::InvalidateCaches) {
+                    self.invalidate_pipeline_caches();
+                }
             }
             #[cfg(not(target_arch = "wasm32"))]
             GxAction::DumpTextures { dir } => {
@@ -340,9 +480,11 @@ impl GxRenderer {
                 wrap_t,
                 mag_filter,
                 min_filter,
+                lod,
             } => {
                 self.current_texture_ids[*slot] = Some(*id);
-                let sampler_key: SamplerKey = (*wrap_s, *wrap_t, *mag_filter, *min_filter);
+                self.current_lod_bias[*slot] = f32::from(lod.bias) / 32.0;
+                let sampler_key: SamplerKey = (*wrap_s, *wrap_t, *mag_filter, *min_filter, lod.min, lod.max);
                 self.current_sampler_keys[*slot] = Some(sampler_key);
                 self.ensure_sampler(device, &sampler_key);
             }
@@ -406,15 +548,14 @@ impl GxRenderer {
                     } else {
                         ShaderSpecializationKey::from_draw(state, self.current_alpha_compare, shader_key)
                     };
-                    let ztex_enabled = state.ztex_op != 0;
+                    let per_pixel_depth = state.ztex_op != 0 || state.zfreeze.is_some();
                     let active = if self.current_shader_key.is_some() {
                         self.current_active_texture_mask
                     } else {
                         draw_active_slot_mask(state)
                     };
-                    let num_indirect_stages = state.num_indirect_stages;
                     let next_frame_uniform = (state_changed || self.last_frame_uniform_index.is_none())
-                        .then(|| build_frame_uniform(state, self.current_alpha_compare));
+                        .then(|| build_frame_uniform(state, self.current_alpha_compare, self.efb_scale));
                     if !self.shader_cache.contains_key(&shader_key) {
                         #[cfg(feature = "gx-stats")]
                         let shader_started = std::time::Instant::now();
@@ -434,38 +575,15 @@ impl GxRenderer {
                         tracing::info!(?shader_key, "compiled specialized shader variant");
                     }
 
-                    let pipeline_key = self.current_pipeline_key(ztex_enabled);
+                    let pipeline_key = self.current_pipeline_key(per_pixel_depth);
                     let full_key = FullPipelineKey {
                         shader: shader_key,
                         specialization,
                         fixed: pipeline_key,
                     };
 
-                    if !self.pipeline_cache.contains_key(&full_key) {
-                        let uber_key = UberPipelineKey::from(full_key);
-
-                        if !self.uber_pipeline_cache.contains_key(&uber_key) {
-                            #[cfg(feature = "gx-stats")]
-                            let pipeline_started = std::time::Instant::now();
-                            let module = &self.shader_cache[&shader_key];
-                            let pipeline = crate::pipeline::create_uber_pipeline(
-                                device,
-                                &self.pipeline_layout,
-                                self.surface_format,
-                                module,
-                                &uber_key,
-                            );
-                            self.uber_pipeline_cache.insert(uber_key, pipeline);
-                            #[cfg(feature = "gx-stats")]
-                            {
-                                self.stats.pipelines_created.fetch_add(1, Ordering::Relaxed);
-                                self.stats
-                                    .pipeline_create_cpu_ns
-                                    .fetch_add(pipeline_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                            }
-                        }
-
-                        self.request_specialized_pipeline(full_key);
+                    for key in std::iter::once(full_key).chain(full_key.alpha_pass_key()) {
+                        self.ensure_pipeline(device, key);
                     }
 
                     let first_vertex = draw.base_vertex;
@@ -479,28 +597,29 @@ impl GxRenderer {
 
                     let mut tex_dims = [UVec4::splat(1); 4];
 
-                    if num_indirect_stages > 0 {
-                        for slot in 0..8 {
-                            if (active >> slot) & 1 == 0 {
-                                continue;
-                            }
-
-                            let Some(tid) = &self.current_texture_ids[slot] else {
-                                continue;
-                            };
-
-                            let Some((_, tex, _)) = self.texture_cache.get(tid) else {
-                                continue;
-                            };
-
-                            let size = tex.size();
-                            let c = (slot % 2) * 2;
-                            tex_dims[slot / 2][c] = size.width;
-                            tex_dims[slot / 2][c + 1] = size.height;
+                    for slot in 0..8 {
+                        if (active >> slot) & 1 == 0 {
+                            continue;
                         }
+
+                        let Some(tid) = &self.current_texture_ids[slot] else {
+                            continue;
+                        };
+
+                        let Some(cached) = self.texture_cache.get(tid) else {
+                            continue;
+                        };
+
+                        let c = (slot % 2) * 2;
+                        tex_dims[slot / 2][c] = cached.native_w;
+                        tex_dims[slot / 2][c + 1] = cached.native_h;
                     }
 
-                    let draw_uniform = DrawUniforms { mvp, tex_dims };
+                    let draw_uniform = DrawUniforms {
+                        mvp,
+                        tex_dims,
+                        tex_lod_bias: self.current_lod_bias,
+                    };
                     let draw_uniform_bytes = bytemuck::bytes_of(&draw_uniform);
                     let bg_key = trim_bg_key(self.current_bind_group_key(), active);
                     let stride = crate::packed_vertex_stride(shader_key.active_texcoords);
@@ -553,7 +672,7 @@ impl GxRenderer {
                         self.merge_into_previous(previous, draw);
                     } else {
                         let first_index = self.scratch_indices.len() as u32;
-                        let (_, index_count) = emit_draw_indices(draw, &mut self.scratch_indices, 0);
+                        let index_count = self::emit_draw_indices(draw, &mut self.scratch_indices, 0);
 
                         let start = self.scratch_draws.len() * draw_stride;
                         self.scratch_uniform_bytes.resize(start + draw_stride, 0);
@@ -667,6 +786,7 @@ impl GxRenderer {
                     *stride,
                     *depth_copy,
                     *is_intensity,
+                    *alpha_supported,
                 );
 
                 if *clear {
@@ -690,9 +810,15 @@ impl GxRenderer {
 
     /// Flush accumulated draw calls into a render pass.
     pub fn flush_pending_draws(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.flush_draws_keep_vertices(device, queue) {
+            self.scratch_vertices.clear();
+        }
+    }
+
+    fn flush_draws_keep_vertices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
         self.poll_compiled_pipelines();
         if self.scratch_draws.is_empty() {
-            return;
+            return false;
         }
 
         debug_assert_eq!(self.scratch_draws.len(), self.draw_pipeline_keys.len());
@@ -715,7 +841,6 @@ impl GxRenderer {
 
         self.execute_action_render_pass(device);
 
-        self.scratch_vertices.clear();
         self.scratch_indices.clear();
         self.scratch_draws.clear();
         self.scratch_uniform_bytes.clear();
@@ -728,6 +853,8 @@ impl GxRenderer {
         self.last_frame_uniform_index = None;
         #[cfg(feature = "renderdoc-capture")]
         self.draw_primitives.clear();
+
+        true
     }
 
     fn execute_action_render_pass(&mut self, device: &wgpu::Device) {
@@ -755,10 +882,12 @@ impl GxRenderer {
         let target_width = self.scaled(crate::EFB_WIDTH);
         let target_height = self.scaled(crate::EFB_HEIGHT);
         let scale = self.efb_scale as f32;
-        let fallback_sampler_key = (WrapMode::Clamp, WrapMode::Clamp, MagFilter::Linear, MinFilter::Linear);
+        let fallback_sampler_key = crate::DEFAULT_SAMPLER_KEY;
         let frame_stride = self.frame_stride;
 
         let num_draws = self.draw_bg_keys.len();
+        #[cfg(feature = "gx-stats")]
+        let mut draws_encoded = num_draws as u64;
         for i in 0..num_draws {
             let bg_key = &self.draw_bg_keys[i];
             if self.bind_group_cache.contains_key(bg_key) {
@@ -772,14 +901,19 @@ impl GxRenderer {
                 for slot in 0..8 {
                     if let Some(tid) = &bg_key.tex_keys[slot] {
                         let tex_entry = self.texture_cache.get(tid);
-                        let efb_match = tex_entry.and_then(|(tex_fmt, tex_tex, _)| {
-                            let size = tex_tex.size();
+                        let efb_match = tex_entry.and_then(|cached| {
+                            if cached.texture.mip_level_count() != 1 {
+                                return None;
+                            }
+
+                            let size = cached.texture.size();
                             self.efb_copy_cache
                                 .get(&tid.ram_addr)
-                                .filter(|e| e.matches(*tex_fmt, size.width, size.height))
+                                .filter(|e| e.matches(cached.fmt, size.width, size.height))
                                 .map(|e| &e.view)
                         });
-                        if let Some(view) = efb_match.or_else(|| tex_entry.map(|(_, _, v)| v)) {
+
+                        if let Some(view) = efb_match.or_else(|| tex_entry.map(|cached| &cached.view)) {
                             tex_views[slot] = view;
                         } else {
                             tracing::warn!(
@@ -856,7 +990,7 @@ impl GxRenderer {
                 wgpu::LoadOp::Load
             };
             let depth_load = if needs_initial_clear {
-                wgpu::LoadOp::Clear(1.0)
+                wgpu::LoadOp::Clear(0.0)
             } else {
                 wgpu::LoadOp::Load
             };
@@ -896,7 +1030,7 @@ impl GxRenderer {
             #[cfg(feature = "renderdoc-capture")]
             {
                 if needs_initial_clear {
-                    rpass.insert_debug_marker("EFB initial clear: color=black depth=1.0");
+                    rpass.insert_debug_marker("EFB initial clear: color=black reversed_depth=0.0");
                 } else {
                     rpass.insert_debug_marker("EFB load existing color/depth");
                 }
@@ -959,10 +1093,7 @@ impl GxRenderer {
                     rpass.push_debug_group(&draw_label);
                 }
                 let full_key = &self.draw_pipeline_keys[index];
-                let pipeline = self
-                    .pipeline_cache
-                    .get(full_key)
-                    .unwrap_or_else(|| &self.uber_pipeline_cache[&UberPipelineKey::from(*full_key)]);
+                let pipeline = self.resolve_pipeline(full_key);
                 let pipeline_ptr = pipeline as *const wgpu::RenderPipeline;
                 if pipeline_ptr != last_pipeline_ptr {
                     rpass.set_pipeline(pipeline);
@@ -1007,8 +1138,8 @@ impl GxRenderer {
                 let vp_h = (vp.h * scale).clamp(1.0, max_dim);
 
                 if vp_x.is_finite() && vp_y.is_finite() && vp_w.is_finite() && vp_h.is_finite() {
-                    let mut min_d = vp.min_depth.clamp(0.0, 1.0);
-                    let mut max_d = vp.max_depth.clamp(0.0, 1.0);
+                    let mut min_d = 1.0 - vp.max_depth.clamp(0.0, 1.0);
+                    let mut max_d = 1.0 - vp.min_depth.clamp(0.0, 1.0);
                     if min_d > max_d {
                         std::mem::swap(&mut min_d, &mut max_d);
                     }
@@ -1115,10 +1246,39 @@ impl GxRenderer {
                     rpass.insert_debug_marker(&raster_marker);
                 }
 
-                if index_count == 0 {
-                    rpass.draw(first_vertex..first_vertex + vertex_count, 0..1);
+                let draw_range = |rpass: &mut wgpu::RenderPass<'_>, start: u32, len: u32| {
+                    if index_count == 0 {
+                        rpass.draw(first_vertex + start..first_vertex + start + len, 0..1);
+                    } else {
+                        rpass.draw_indexed(
+                            first_index + start..first_index + start + len,
+                            first_vertex as i32,
+                            0..1,
+                        );
+                    }
+                };
+                let count = if index_count == 0 { vertex_count } else { index_count };
+
+                if let Some(alpha_key) = full_key.alpha_pass_key() {
+                    let alpha_pipeline = self.resolve_pipeline(&alpha_key);
+                    let triangles = count / 3;
+                    for triangle in 0..triangles {
+                        if triangle > 0 {
+                            rpass.set_pipeline(pipeline);
+                        }
+                        draw_range(&mut rpass, triangle * 3, 3);
+                        rpass.set_pipeline(alpha_pipeline);
+                        draw_range(&mut rpass, triangle * 3, 3);
+                    }
+                    last_pipeline_ptr = alpha_pipeline as *const wgpu::RenderPipeline;
+                    #[cfg(feature = "gx-stats")]
+                    {
+                        let extra = (2 * u64::from(triangles)).saturating_sub(1);
+                        pipeline_changes += extra;
+                        draws_encoded += extra;
+                    }
                 } else {
-                    rpass.draw_indexed(first_index..first_index + index_count, first_vertex as i32, 0..1);
+                    draw_range(&mut rpass, 0, count);
                 }
 
                 #[cfg(feature = "renderdoc-capture")]
@@ -1134,7 +1294,7 @@ impl GxRenderer {
 
         #[cfg(feature = "gx-stats")]
         {
-            self.stats.draws_encoded.fetch_add(num_draws as u64, Ordering::Relaxed);
+            self.stats.draws_encoded.fetch_add(draws_encoded, Ordering::Relaxed);
             self.stats.draw_render_passes.fetch_add(1, Ordering::Relaxed);
             self.stats
                 .pipeline_changes
@@ -1178,6 +1338,9 @@ impl GxRenderer {
                 address_mode_v: helpers::map_wrap_mode(key.1),
                 mag_filter: helpers::map_mag_filter(key.2),
                 min_filter: helpers::map_min_filter(key.3),
+                mipmap_filter: helpers::map_mipmap_filter(key.3),
+                lod_min_clamp: f32::from(key.4) / 16.0,
+                lod_max_clamp: f32::from(key.5) / 16.0,
                 ..Default::default()
             })
         });
@@ -1194,77 +1357,21 @@ fn uniform_slots_equal(bytes: &[u8], stride: usize, size: usize, a: u32, b: u32)
 }
 
 fn draw_emits_triangles(draw: &DrawSegment) -> bool {
-    use gecko::flipper::gx::draw::Primitive;
-
-    match draw.primitive {
-        Primitive::Triangles | Primitive::TriangleStrip | Primitive::TriangleFan | Primitive::Quads => {
-            draw.vertex_count >= 3
-        }
-        _ => {
-            tracing::error!(?draw.primitive, "draw_emits_triangles: skipping unsupported primitive");
-            false
-        }
+    if !draw.primitive.emits_triangles() {
+        tracing::error!(?draw.primitive, "draw_emits_triangles: skipping unsupported primitive");
+        return false;
     }
+
+    draw.vertex_count >= 3
 }
 
-fn emit_draw_indices(draw: &DrawSegment, indices_out: &mut Vec<u32>, vertex_bias: u32) -> (u32, u32) {
-    use gecko::flipper::gx::draw::Primitive;
+fn emit_draw_indices(draw: &DrawSegment, indices_out: &mut Vec<u32>, vertex_bias: u32) -> u32 {
+    let count = draw.primitive.triangle_count(draw.vertex_count) * 3;
+    indices_out.reserve(count as usize);
 
-    let n = draw.vertex_count;
-
-    match draw.primitive {
-        Primitive::Triangles => {
-            let emitted = n - n % 3;
-            indices_out.extend((0..emitted).map(|i| vertex_bias + i));
-
-            (n, emitted)
-        }
-        Primitive::Quads => {
-            let chunks = n / 4;
-            for q in 0..chunks {
-                let base = vertex_bias + q * 4;
-                indices_out.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            }
-
-            let mut index_count = chunks * 6;
-
-            if n % 4 == 3 {
-                let base = vertex_bias + chunks * 4;
-                indices_out.extend_from_slice(&[base, base + 1, base + 2]);
-                index_count += 3;
-            }
-
-            (n, index_count)
-        }
-        Primitive::TriangleStrip => {
-            if n < 3 {
-                return (0, 0);
-            }
-
-            let tris = n - 2;
-            for i in 0..tris {
-                if i & 1 == 0 {
-                    indices_out.extend_from_slice(&[vertex_bias + i, vertex_bias + i + 1, vertex_bias + i + 2]);
-                } else {
-                    indices_out.extend_from_slice(&[vertex_bias + i + 1, vertex_bias + i, vertex_bias + i + 2]);
-                }
-            }
-            (n, tris * 3)
-        }
-        Primitive::TriangleFan => {
-            if n < 3 {
-                return (0, 0);
-            }
-
-            let tris = n - 2;
-            for i in 0..tris {
-                indices_out.extend_from_slice(&[vertex_bias, vertex_bias + i + 1, vertex_bias + i + 2]);
-            }
-            (n, tris * 3)
-        }
-        _ => {
-            tracing::error!(?draw.primitive, "emit_draw_indices: skipping unsupported primitive");
-            (0, 0)
-        }
+    for tri in draw.primitive.triangles(draw.vertex_count) {
+        indices_out.extend(tri.map(|i| vertex_bias + i));
     }
+
+    count
 }

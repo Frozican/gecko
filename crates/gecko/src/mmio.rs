@@ -8,10 +8,11 @@ use crate::system::{SystemId, WII};
 use constants::*;
 use rustc_hash::FxHashSet;
 
-pub const FASTMEM_LUT_PAGES: usize = 1 << 15;
-pub const FASTMEM_PAGE_BYTES: usize = 1 << 17;
+// A page must fit the entire locked cache without mapping bytes beyond it.
+pub const FASTMEM_LUT_PAGES: usize = 1 << 18;
+pub const FASTMEM_PAGE_BYTES: usize = 1 << 14;
 pub const FASTMEM_PAGE_MASK: u32 = (FASTMEM_PAGE_BYTES as u32) - 1;
-pub const FASTMEM_PAGE_SHIFT: u32 = 17;
+pub const FASTMEM_PAGE_SHIFT: u32 = 14;
 
 pub const CODE_LINE_BYTES: u32 = 32;
 pub const CODE_LINE_SHIFT: u32 = 5;
@@ -37,11 +38,13 @@ pub struct Mmio<const SYSTEM: SystemId> {
     pub ram_ptr: usize,
     pub fastmem_lut: Vec<usize>,
     pub fastmem_lut_ptr: usize,
+    pub(crate) lcache_fastmem_ptr: usize,
     pub code_refcount: Box<[u8]>,
     pub code_refcount_ptr: usize,
     memory_write_generation: u64,
     memory_page_generations: Box<[u64]>,
     efb_writeback_pages: FxHashSet<u32>,
+    efb_writeback_ranges: Vec<std::ops::Range<u32>>,
     #[cfg(feature = "jit")]
     pub pending_icbi: FxHashSet<u32>,
     #[cfg(feature = "jit")]
@@ -192,11 +195,13 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
             ram_ptr,
             fastmem_lut,
             fastmem_lut_ptr,
+            lcache_fastmem_ptr: 0,
             code_refcount,
             code_refcount_ptr,
             memory_write_generation: 0,
             memory_page_generations: vec![0; dirty_page_count].into_boxed_slice(),
             efb_writeback_pages: FxHashSet::default(),
+            efb_writeback_ranges: Vec::new(),
             #[cfg(feature = "jit")]
             pending_icbi: FxHashSet::default(),
             #[cfg(feature = "jit")]
@@ -216,6 +221,16 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
         let Some(end) = addr.checked_add(len) else {
             return;
         };
+
+        let mut range = addr..end;
+        self.efb_writeback_ranges.retain(|other| {
+            let touches = range.start <= other.end && other.start <= range.end;
+            if touches {
+                range = range.start.min(other.start)..range.end.max(other.end);
+            }
+            !touches
+        });
+        self.efb_writeback_ranges.push(range);
 
         let first_page = addr >> FASTMEM_PAGE_SHIFT;
         let last_page = (end - 1) >> FASTMEM_PAGE_SHIFT;
@@ -240,19 +255,24 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
     }
 
     #[inline(always)]
+    pub fn has_deferred_efb_writebacks(&self) -> bool {
+        !self.efb_writeback_ranges.is_empty()
+    }
+
+    #[inline(always)]
     pub fn efb_writeback_needed(&self, phys: u32, len: usize) -> bool {
-        if self.efb_writeback_pages.is_empty() {
+        if len == 0 || self.efb_writeback_ranges.is_empty() {
             return false;
         }
 
-        let end = phys.saturating_add(len.saturating_sub(1) as u32);
-        let first_page = phys >> FASTMEM_PAGE_SHIFT;
-        let last_page = end >> FASTMEM_PAGE_SHIFT;
-
-        (first_page..=last_page).any(|page| self.efb_writeback_pages.contains(&page))
+        let end = phys as u64 + len as u64;
+        self.efb_writeback_ranges
+            .iter()
+            .any(|range| phys < range.end && (range.start as u64) < end)
     }
 
     pub fn clear_deferred_efb_writebacks(&mut self) {
+        self.efb_writeback_ranges.clear();
         if !self.efb_writeback_pages.is_empty() {
             self.memory_write_generation = self.memory_write_generation.wrapping_add(1).max(1);
         }
@@ -360,6 +380,17 @@ impl<const SYSTEM: SystemId> Mmio<SYSTEM> {
             "read_u32"
         );
         value
+    }
+
+    #[inline(always)]
+    pub fn phys_read_u64(&self, addr: u32) -> u64 {
+        ((self.phys_read_u32(addr) as u64) << 32) | self.phys_read_u32(addr + 4) as u64
+    }
+
+    #[inline(always)]
+    pub fn phys_write_u64(&mut self, addr: u32, value: u64) {
+        self.phys_write_u32(addr, (value >> 32) as u32);
+        self.phys_write_u32(addr + 4, value as u32);
     }
 
     #[inline(always)]

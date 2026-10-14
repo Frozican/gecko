@@ -32,6 +32,8 @@ Gecko is developed with homebrew development and reverse engineering in mind, bu
 - Cranelift based JITs
   - PowerPC, DSP, vertex decoder
 - Upscaling 1x - 4x
+- Texture packs
+  - Implements Dolphin style pack support
 - Controller support
   - Xbox, Steam, etc.
   - PS5 DualSense Wiimote motion control
@@ -69,33 +71,44 @@ Gecko is developed with homebrew development and reverse engineering in mind, bu
   - [incl. debugging capabilities](https://gecko.layle.dev/dbg)
 
 ## Usage
-Prebuilt releases (including debug builds) can be downloaded [here](https://github.com/ioncodes/gecko/releases). GameCube and Wii require system files to use the emulator, please refer to the ["Required Files"](https://github.com/ioncodes/gecko#required-files) chapter. Minimal commands to launch a game:
+Prebuilt releases (including debug builds) can be downloaded [here](https://github.com/ioncodes/gecko/releases). Gecko boots most games without any system files, using Dolphin's DSP ROM and an IPL HLE. Real dumps can still be used and are more accurate, please refer to the ["Required Files"](https://github.com/ioncodes/gecko#required-files) chapter.
 
-```sh
-# Launch a GameCube game
-./tinyapp --ipl IPL.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --skip-ipl --dvd YourGame.rvz
-
-# Launch a Wii game
-./tinyapp --dsp dsp_rom.bin --coef dsp_coef.bin --dvd YourGame.rvz
-```
-
-A more modern and friendly experience is provided via `gecko` ([short preview on YouTube](https://www.youtube.com/watch?v=wg62ie71JP0)):
+A modern and friendly experience is provided via `gecko` ([short preview on YouTube](https://www.youtube.com/watch?v=aCQSc70FV4k)):
 
 ![launcher](images/launcher.png)
 
-It scans the configured GameCube and Wii folders for `.iso`, `.rvz` and `.zip` files. Double-clicking on a row opens a dedicated player window for that game. The decoded GameCube IPL and DSP files are expected to be inside the `system` folder and **must** be named exactly as follows:
+On first launch, a guided setup popup asks for an optional DSP ROM (`dsp_rom.bin`), DSP coefficient ROM (`dsp_coef.bin`), GameCube IPL and your game folders. It validates and copies the system files with the correct names, automatically decodes an encoded IPL, saves your settings and scans your games. You can skip setup for now or reopen it from **Settings -> Guided Setup**.
+
+Enable **Settings -> Boot -> IPL HLE (GameCube)** to boot GameCube discs using [Hazel's](https://codeberg.org/hazelwiss) built-in IPL replacement, even if a real IPL is installed. The setting is saved as `ipl_hle = true` in `config.toml` and applies the next time you launch a game. Guided setup enables HLE automatically if you leave the IPL file empty. Disable HLE to use your real IPL. **Skip IPL (GameCube)** then controls whether its boot animation is skipped. Either boot method uses Dolphin's DSP ROM unless real DSP dumps are configured.
+
+You can also import an optional Wii NAND folder containing `title/` and `shared2/`. The wizard copies it into `fs/` (or `GECKO_FS_ROOT`) only if that destination does not already exist, preserving existing saves. Otherwise, leave NAND unselected to keep existing storage or generate it on first boot.
+
+The launcher scans the configured GameCube and Wii folders for `.iso`, `.rvz` and `.zip` files. Double-clicking on a row opens a dedicated player window for that game. For manual setup, place optional DSP dumps and, if using real IPL boot, a decoded GameCube IPL inside `system` using the names below. Data paths are relative to the working directory or `GECKO_DATA_DIR` when set:
 
 ```sh
-<gecko exe dir>/
+<gecko data dir>/
   config.toml                # settings, auto-generated
   cache/library.bin          # cached library, auto-generated
   screenshots/               # F12 screenshots, auto-generated
   internal/                  # contains SRAM and memory cards, auto-generated
-  system/                    # system file folder (user provided!)
-    IPL.bin                  # GameCube only (must be decoded! see multitool)
-    dsp_rom.bin              # GameCube and Wii
-    dsp_coef.bin             # GameCube and Wii
+  system/                    # system files, copied by guided setup
+    IPL.bin                  # GameCube real IPL boot only (must be decoded! see multitool)
+    dsp_rom.bin              # optional, GameCube and Wii
+    dsp_coef.bin             # optional, GameCube and Wii
   fs/                        # Wii NAND, auto-generated if missing (or drop in a Dolphin/real dump)
+```
+
+If you're a developer you may want to use `tinyapp` or `debugger` instead, the quickest way to boot up a game is:
+
+```sh
+# Launch a GameCube game with the built-in IPL HLE and Dolphin's DSP ROM
+./tinyapp --dvd YourGame.rvz
+
+# Launch a GameCube game with a real IPL (skip the boot animation)
+./tinyapp --ipl IPL.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --skip-ipl --dvd YourGame.rvz
+
+# Launch a Wii game with real DSP dumps (optional)
+./tinyapp --dsp dsp_rom.bin --coef dsp_coef.bin --dvd YourGame.rvz
 ```
 
 ### Controls
@@ -161,21 +174,23 @@ Keyboard and player-window hotkeys are configurable the same way under `Settings
 | `Space` | Start emulation from the splash screen (`--wait` flag)             |
 | `F5`    | Save state (overwrites the game's existing state)                  |
 | `F7`    | Load state                                                         |
+| `F8`    | Attach / detach Nunchuk (Wii only)                                 |
+| `F9`    | Switch Wiimote upright / sideways (Wii only)                       |
 | `F10`   | Trigger a RenderDoc capture (requires `renderdoc-capture` feature) |
 | `F11`   | Screenshot the full window                                         |
 | `F12`   | Screenshot the emulated framebuffer only                           |
 
 `gecko` player window:
 
-| Key     | Action                                                                |
-| ------- | --------------------------------------------------------------------- |
-| `Space` | Pause / resume emulation                                              |
-| `Tab`   | Toggle the speed limit (run uncapped)                                 |
-| `F5`    | Save state (overwrites the game's existing state)                     |
-| `F7`    | Load state                                                            |
-| `F10`   | Toggle borderless fullscreen                                          |
-| `F11`   | Toggle the FPS and emulation speed overlay                            |
-| `F12`   | Screenshot the emulated framebuffer to `<gecko exe dir>/screenshots/` |
+| Key     | Action                                                                 |
+| ------- | ---------------------------------------------------------------------- |
+| `Space` | Pause / resume emulation                                               |
+| `Tab`   | Toggle the speed limit (run uncapped)                                  |
+| `F5`    | Save state (overwrites the game's existing state)                      |
+| `F7`    | Load state                                                             |
+| `F10`   | Toggle borderless fullscreen                                           |
+| `F11`   | Toggle the FPS and emulation speed overlay                             |
+| `F12`   | Screenshot the emulated framebuffer to `<gecko data dir>/screenshots/` |
 
 </details>
 
@@ -224,6 +239,16 @@ Nunchuk:
 
 </details>
 
+### Texture packs
+
+The main `gecko` app and `tinyapp` load Dolphin `tex1_` texture packs automatically from
+`texturepacks/<game ID>/` in the data directory (the working directory by default,
+or `GECKO_DATA_DIR`).
+
+In the Gecko app, use **Settings -> Graphics -> Texture Packs (restart game)** to
+toggle replacements. In tinyapp, use `--no-texture-packs` to disable them or
+`--texture-pack-dir <directory>` to select a different pack root.
+
 ### Savestates
 
 `tinyapp`, `debugger` and the `gecko` player support saving and loading GameCube and Wii emulation state with `F5` and `F7`. The debugger also provides Save State and Load State menu actions. In `gecko`, these hotkeys are configurable under `Settings > Keyboard Bindings`; requests made while paused are processed after emulation resumes.
@@ -248,7 +273,10 @@ The panel also provides a speed slider and `Reset view` button. Game input is su
 
 ## Required files
 
-Gecko does not ship any system files.  
+Gecko does not ship original console ROMs. A built-in IPL HLE replacement is available for GameCube disc boot.
+
+> [!NOTE]
+> Gecko embeds Dolphin's DSP ROM replacement (`dsp_rom.bin` and `dsp_coef.bin` from [`Data/Sys/GC`](https://github.com/dolphin-emu/dolphin/tree/master/Data/Sys/GC), source in [`docs/DSP/free_dsp_rom`](https://github.com/dolphin-emu/dolphin/tree/master/docs/DSP/free_dsp_rom)) and uses it whenever no DSP dump is provided. It is written by the Dolphin team, not dumped from hardware. It covers the common AX and Zelda audio ucodes, however, it may still cause issues. If anything misbehaves, try real dumps.
 
 Reference SHA-256 hashes (these are the files the project is developed against):
 
@@ -262,11 +290,13 @@ Reference SHA-256 hashes (these are the files the project is developed against):
 | `dsp_coef.bin`               | `d7741279c2e8ec5c5fb318f8fbdd6de6bf583520d288e836a5383233a4238179` |
 
 ### GameCube
-- IPL (NTSC and PAL tested)
-- DSP IROM
-- DSP coefficient ROM
+- IPL for real IPL boot only (NTSC and PAL tested); not required with IPL HLE
+- DSP IROM (optional, Dolphin's is used by default)
+- DSP coefficient ROM (optional, Dolphin's is used by default)
 
-If you only have an encoded IPL, decode it first with multitool:
+For IPL HLE in `tinyapp`, pass `--dvd` without `--ipl`. In the `gecko` app, enable **Settings -> Boot -> IPL HLE (GameCube)**.
+
+If using a real IPL and you only have an encoded copy, decode it first with multitool (guided setup does this automatically):
 
 ```sh
 multitool ipl --action decode private/IPL.bin private/IPL.decoded.bin
@@ -291,7 +321,7 @@ multitool setting --action decode fs/title/00000001/00000002/data/setting.txt se
 multitool setting --action encode setting.decoded fs/title/00000001/00000002/data/setting.txt
 multitool dvd --extract game.rvz
 
-tinyapp --dol homebrew.dol  # may also require a DSP depending on the DOL
+tinyapp --dol homebrew.dol
 tinyapp --dvd game.iso --ipl ipl.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --skip-ipl
 
 debugger --dvd game.rvz --ipl ipl.decoded.bin --dsp dsp_rom.bin --coef dsp_coef.bin --script example.lua
@@ -402,7 +432,7 @@ Features below are listed based on the frontend crate that supports them. Most o
 </details>
 
 ## Why?
-Why do we get a new Wii emulator? Well, it all started a few years ago. I wanted to do something nostalgic and as a kid I spent countless hour in this one Wii game called *Final Fantasy Crystal Chronicals: The Crystal Bearers*. It wasn't a well received game but I loved it so much, I chose my online persona "Layle" after the main protagonist. I figured it would be cool to spend some years learning about emulation development with the goal to eventually run the game in my own emulator!
+Why do we get a new Wii emulator? Well, it all started a few years ago. I wanted to do something nostalgic and as a kid I spent countless hours playing one Wii game in particular: *Final Fantasy Crystal Chronicles: The Crystal Bearers*. I think it wasn't a well received game, but I loved it so much that I named the username I usually go by, "Layle", after its main protagonist. I figured it would be cool to spend a few years learning about emulator development, with the goal of eventually running the game in my own emulator!
 
 ## Sister Projects
 Gecko is being developed alongside other amazing emulators that shaped how Gecko came to be. Without them, Gecko wouldn't exist!

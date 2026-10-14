@@ -61,13 +61,58 @@ pub(crate) struct PipelineKey {
     pub color_update: bool,
     pub alpha_update: bool,
     pub cull_mode: CullMode,
-    /// Z-texturing active for this draw: selects the `fs_main_ztex` entry
+    /// Z-texturing or Z-freeze active: selects the `fs_main_depth` entry
     /// point, which writes `frag_depth` (disabling early-Z only where needed).
-    pub ztex: bool,
+    pub per_pixel_depth: bool,
+    pub dst_alpha: bool,
+    pub alpha_pass: bool,
 }
 
 impl PipelineKey {
-    const BYTES: usize = 13;
+    const BYTES: usize = 15;
+
+    fn color_blend(&self) -> Option<wgpu::BlendState> {
+        if self.blend_enable {
+            // In subtract mode the hardware ignores the configured src/dst
+            // factors and computes `dst = dst - src` with ONE/ONE.
+            let (src_factor, dst_factor, operation) = if self.subtract {
+                (
+                    wgpu::BlendFactor::One,
+                    wgpu::BlendFactor::One,
+                    wgpu::BlendOperation::ReverseSubtract,
+                )
+            } else {
+                (
+                    helpers::map_src_blend_factor(self.src_factor),
+                    helpers::map_dst_blend_factor(self.dst_factor),
+                    wgpu::BlendOperation::Add,
+                )
+            };
+            Some(make_blend_state(src_factor, dst_factor, operation))
+        } else if self.logic_op_enable {
+            let (be, sub, sf, df) = logic_op_approximation(self.logic_op);
+            be.then(|| {
+                let operation = if sub {
+                    wgpu::BlendOperation::ReverseSubtract
+                } else {
+                    wgpu::BlendOperation::Add
+                };
+                make_blend_state(sf, df, operation)
+            })
+        } else {
+            None
+        }
+    }
+
+    fn splits_dst_alpha(&self) -> bool {
+        use wgpu::BlendFactor::{OneMinusSrcAlpha, SrcAlpha, SrcAlphaSaturated};
+        self.dst_alpha
+            && self.color_blend().is_some_and(|b| {
+                [b.color.src_factor, b.color.dst_factor]
+                    .iter()
+                    .any(|f| matches!(f, SrcAlpha | OneMinusSrcAlpha | SrcAlphaSaturated))
+            })
+    }
 
     fn to_bytes(self) -> [u8; Self::BYTES] {
         [
@@ -83,7 +128,9 @@ impl PipelineKey {
             self.color_update as u8,
             self.alpha_update as u8,
             self.cull_mode.raw(),
-            self.ztex as u8,
+            self.per_pixel_depth as u8,
+            self.dst_alpha as u8,
+            self.alpha_pass as u8,
         ]
     }
 
@@ -101,7 +148,9 @@ impl PipelineKey {
             color_update: b[9] != 0,
             alpha_update: b[10] != 0,
             cull_mode: CullMode::from_raw(b[11]),
-            ztex: b[12] != 0,
+            per_pixel_depth: b[12] != 0,
+            dst_alpha: b[13] != 0,
+            alpha_pass: b[14] != 0,
         }
     }
 }
@@ -128,14 +177,47 @@ impl From<FullPipelineKey> for UberPipelineKey {
     }
 }
 
+impl UberPipelineKey {
+    fn to_bytes(self) -> [u8; UBER_PIPELINE_KEY_BYTES] {
+        let mut out = [0u8; UBER_PIPELINE_KEY_BYTES];
+        out[..SHADER_KEY_BYTES].copy_from_slice(&self.shader.to_bytes());
+        out[SHADER_KEY_BYTES..].copy_from_slice(&self.fixed.to_bytes());
+        out
+    }
+
+    fn from_bytes(b: &[u8; UBER_PIPELINE_KEY_BYTES]) -> Self {
+        Self {
+            shader: ShaderKey::from_bytes(b[..SHADER_KEY_BYTES].try_into().unwrap()),
+            fixed: PipelineKey::from_bytes(b[SHADER_KEY_BYTES..].try_into().unwrap()),
+        }
+    }
+}
+
 pub(crate) const FULL_PIPELINE_KEY_BYTES: usize = SHADER_KEY_BYTES + SPECIALIZATION_KEY_BYTES + PipelineKey::BYTES;
+const UBER_PIPELINE_KEY_BYTES: usize = SHADER_KEY_BYTES + PipelineKey::BYTES;
 const PIPELINE_CACHE_MAGIC: [u8; 4] = *b"GPKC";
-const PIPELINE_CACHE_VERSION: u32 = crate::shader_specialization::CACHE_VERSION;
+const UBER_PIPELINE_CACHE_MAGIC: [u8; 4] = *b"GUKC";
+const PIPELINE_CACHE_VERSION: u32 = 11;
+
 pub(crate) fn pipeline_cache_path() -> std::path::PathBuf {
     gecko::paths::cache("pipeline_keys.bin")
 }
 
+pub(crate) fn uber_pipeline_cache_path() -> std::path::PathBuf {
+    gecko::paths::cache("uber_pipeline_keys.bin")
+}
+
 impl FullPipelineKey {
+    pub(crate) fn alpha_pass_key(&self) -> Option<Self> {
+        self.fixed.splits_dst_alpha().then_some(Self {
+            fixed: PipelineKey {
+                alpha_pass: true,
+                ..self.fixed
+            },
+            ..*self
+        })
+    }
+
     fn to_bytes(self) -> [u8; FULL_PIPELINE_KEY_BYTES] {
         let mut out = [0u8; FULL_PIPELINE_KEY_BYTES];
         out[..SHADER_KEY_BYTES].copy_from_slice(&self.shader.to_bytes());
@@ -164,6 +246,14 @@ impl FullPipelineKey {
 }
 
 pub(crate) fn load_cached_pipeline_keys(path: &Path) -> Vec<FullPipelineKey> {
+    load_keys(path, PIPELINE_CACHE_MAGIC, FullPipelineKey::from_bytes)
+}
+
+pub(crate) fn load_cached_uber_pipeline_keys(path: &Path) -> Vec<UberPipelineKey> {
+    load_keys(path, UBER_PIPELINE_CACHE_MAGIC, UberPipelineKey::from_bytes)
+}
+
+fn load_keys<const N: usize, K>(path: &Path, magic: [u8; 4], decode: fn(&[u8; N]) -> K) -> Vec<K> {
     let mut f = match File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
@@ -174,7 +264,7 @@ pub(crate) fn load_cached_pipeline_keys(path: &Path) -> Vec<FullPipelineKey> {
         return Vec::new();
     }
 
-    if header[..4] != PIPELINE_CACHE_MAGIC {
+    if header[..4] != magic {
         return Vec::new();
     }
 
@@ -184,15 +274,28 @@ pub(crate) fn load_cached_pipeline_keys(path: &Path) -> Vec<FullPipelineKey> {
     }
 
     let mut keys = Vec::new();
-    let mut buf = [0u8; FULL_PIPELINE_KEY_BYTES];
+    let mut buf = [0u8; N];
     while f.read_exact(&mut buf).is_ok() {
-        keys.push(FullPipelineKey::from_bytes(&buf));
+        keys.push(decode(&buf));
     }
 
     keys
 }
 
 pub(crate) fn save_pipeline_keys(path: &Path, keys: &[FullPipelineKey]) -> std::io::Result<()> {
+    save_keys(path, PIPELINE_CACHE_MAGIC, keys, FullPipelineKey::to_bytes)
+}
+
+pub(crate) fn save_uber_pipeline_keys(path: &Path, keys: &[UberPipelineKey]) -> std::io::Result<()> {
+    save_keys(path, UBER_PIPELINE_CACHE_MAGIC, keys, UberPipelineKey::to_bytes)
+}
+
+fn save_keys<const N: usize, K: Copy>(
+    path: &Path,
+    magic: [u8; 4],
+    keys: &[K],
+    encode: fn(K) -> [u8; N],
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -200,11 +303,11 @@ pub(crate) fn save_pipeline_keys(path: &Path, keys: &[FullPipelineKey]) -> std::
     let f = File::create(path)?;
 
     let mut w = BufWriter::new(f);
-    w.write_all(&PIPELINE_CACHE_MAGIC)?;
+    w.write_all(&magic)?;
     w.write_all(&PIPELINE_CACHE_VERSION.to_le_bytes())?;
 
     for k in keys {
-        w.write_all(&k.to_bytes())?;
+        w.write_all(&encode(*k))?;
     }
 
     w.flush()?;
@@ -309,42 +412,24 @@ fn create_pipeline(
         attributes: &attrs,
     };
 
-    let blend = if key.blend_enable {
-        // In subtract mode the hardware ignores the configured src/dst
-        // factors and computes `dst = dst - src` with ONE/ONE.
-        let (src_factor, dst_factor, operation) = if key.subtract {
-            (
-                wgpu::BlendFactor::One,
-                wgpu::BlendFactor::One,
-                wgpu::BlendOperation::ReverseSubtract,
-            )
-        } else {
-            (
-                helpers::map_src_blend_factor(key.src_factor),
-                helpers::map_dst_blend_factor(key.dst_factor),
-                wgpu::BlendOperation::Add,
-            )
-        };
-        Some(make_blend_state(src_factor, dst_factor, operation))
-    } else if key.logic_op_enable {
-        let (be, sub, sf, df) = logic_op_approximation(key.logic_op);
-        be.then(|| {
-            let operation = if sub {
-                wgpu::BlendOperation::ReverseSubtract
-            } else {
-                wgpu::BlendOperation::Add
-            };
-            make_blend_state(sf, df, operation)
+    let color_pass = key.splits_dst_alpha() && !key.alpha_pass;
+    let stored_alpha = key.dst_alpha && !color_pass;
+    let blend = if key.alpha_pass {
+        None
+    } else if stored_alpha {
+        key.color_blend().map(|blend| wgpu::BlendState {
+            alpha: wgpu::BlendComponent::REPLACE,
+            ..blend
         })
     } else {
-        None
+        key.color_blend()
     };
 
     let depth_stencil = if key.z_enable {
         Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth24Plus,
-            depth_write_enabled: Some(key.z_write),
-            depth_compare: Some(helpers::map_compare_func(key.z_func)),
+            depth_write_enabled: Some(key.z_write && !color_pass),
+            depth_compare: Some(helpers::map_depth_compare_func(key.z_func)),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         })
@@ -359,10 +444,10 @@ fn create_pipeline(
     };
 
     let mut write_mask = wgpu::ColorWrites::empty();
-    if key.color_update {
+    if key.color_update && !key.alpha_pass {
         write_mask |= wgpu::ColorWrites::RED | wgpu::ColorWrites::GREEN | wgpu::ColorWrites::BLUE;
     }
-    if key.alpha_update {
+    if key.alpha_update && !color_pass {
         write_mask |= wgpu::ColorWrites::ALPHA;
     }
 
@@ -380,7 +465,12 @@ fn create_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if key.ztex { "fs_main_ztex" } else { "fs_main" }),
+            entry_point: Some(match (key.per_pixel_depth, stored_alpha) {
+                (false, false) => "fs_main",
+                (true, false) => "fs_main_depth",
+                (false, true) => "fs_main_alpha",
+                (true, true) => "fs_main_depth_alpha",
+            }),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
                 blend,

@@ -18,6 +18,57 @@ pub(super) struct DrawBatchEntry {
     pub vertex_count: usize,
 }
 
+fn filter_skipped_vertices(
+    data: &[u8],
+    entries: &[DrawBatchEntry],
+    vcd: VcdLo,
+    stride: usize,
+    out_data: &mut Vec<u8>,
+    out_entries: &mut Vec<DrawBatchEntry>,
+) -> bool {
+    let position = vcd.position();
+    if !matches!(position, AttributeType::Index8 | AttributeType::Index16) {
+        return false;
+    }
+
+    let first = vcd.mtx_idx_count();
+    let last = first + position.size() - 1;
+    let skipped = |vertex: &[u8]| vertex[first] == 0xff && vertex[last] == 0xff;
+    if !data.chunks_exact(stride).any(skipped) {
+        return false;
+    }
+
+    #[cfg(feature = "jit")]
+    let padding = jit::VEC_OVERREAD_BYTES;
+    #[cfg(not(feature = "jit"))]
+    let padding = 0;
+
+    out_data.clear();
+    out_data.reserve(data.len() + padding);
+    out_entries.clear();
+
+    let mut start = 0;
+    for entry in entries {
+        let end = start + entry.vertex_count * stride;
+        let mut vertex_count = 0;
+
+        for vertex in data[start..end].chunks_exact(stride) {
+            if !skipped(vertex) {
+                out_data.extend_from_slice(vertex);
+                vertex_count += 1;
+            }
+        }
+
+        out_entries.push(DrawBatchEntry {
+            cmd: entry.cmd,
+            vertex_count,
+        });
+        start = end;
+    }
+
+    true
+}
+
 /// Parsed vertex format descriptor from CP/VAT registers.
 struct VertexFormat {
     vat_a: VatA,
@@ -100,6 +151,8 @@ impl GraphicsProcessor {
         if self.recorder.as_ref().is_some_and(|rec| rec.is_recording()) {
             let vf = self.build_vertex_format(cmd);
             let view = mmio.ram_view();
+            let mip_levels: [u32; 8] = std::array::from_fn(|slot| self.texture_mip_levels(slot));
+            let preloaded: [bool; 8] = std::array::from_fn(|slot| self.texture_is_preloaded(slot));
             let rec = self.recorder.as_deref_mut().unwrap();
             let mut offset = 0;
 
@@ -109,8 +162,14 @@ impl GraphicsProcessor {
                 offset += len;
             }
 
-            for desc in self.cur_textures.iter().flatten() {
-                let len = super::texture::raw_data_size(desc.width, desc.height, desc.format);
+            for (slot, desc) in self.cur_textures.iter().enumerate() {
+                if preloaded[slot] {
+                    continue;
+                }
+                let Some(desc) = desc else {
+                    continue;
+                };
+                let len = super::texture::mip_data_size(desc.width, desc.height, desc.format, mip_levels[slot]);
                 rec.use_draw_texture(&view, desc.ram_addr as u32, len);
             }
         }
@@ -128,14 +187,38 @@ impl GraphicsProcessor {
             }
         }
 
+        let mut skip_data = std::mem::take(&mut self.skip_filter_data);
+        let mut skip_entries = std::mem::take(&mut self.skip_filter_entries);
+        let vcd = VcdLo::from_raw(self.cp_regs[VCD_LO_REG]);
+        let (data, entries) =
+            if self::filter_skipped_vertices(data, entries, vcd, vertex_stride, &mut skip_data, &mut skip_entries) {
+                (skip_data.as_slice(), skip_entries.as_slice())
+            } else {
+                (data, entries)
+            };
+
+        let decoded_count = data.len() / vertex_stride;
+        if decoded_count == 0 {
+            self.skip_filter_data = skip_data;
+            self.skip_filter_entries = skip_entries;
+
+            return;
+        }
+
         // Decode directly into the renderer's vertex scratch. No
         // intermediate `draw_vertices_scratch`, no append memcpy. The
         // interpreter pushes into `verts`, and the Cranelift JIT writes
         // through `verts.as_mut_ptr().add(base)` then sets the new length.
         let verts = renderer.vertex_scratch();
         let base_vertex = verts.len() as u32;
-        verts.reserve(vertex_count);
-        self::dispatch_decode(self, mmio, cmd, data, vertex_count, verts);
+        verts.reserve(decoded_count);
+        self::dispatch_decode(self, mmio, cmd, data, decoded_count, verts);
+
+        let zfreeze = GenMode::from_raw(self.bp_regs[BP_GEN_MODE]).z_freeze();
+
+        if !zfreeze {
+            self.update_depth_plane(entries, &verts[base_vertex as usize..]);
+        }
 
         let state = self.frame_state_dirty.then(|| {
             let tev_color_regs = self.resolve_tev_color_regs();
@@ -175,7 +258,11 @@ impl GraphicsProcessor {
 
             let ztex2 = TevZtex2::from_raw(self.bp_regs[BP_TEV_ZTEX2]);
 
+            let dst_alpha = DstAlpha::from_raw(self.bp_regs[BP_PE_CMODE1]);
             DrawState {
+                dst_alpha: (dst_alpha.enable() && self.cur_pe_control.pixel_format().has_alpha())
+                    .then_some(dst_alpha.alpha()),
+                zfreeze: zfreeze.then_some(self.zfreeze_plane),
                 tev_color_env: std::array::from_fn(|i| self.cur_tev_color_env[i].raw()),
                 tev_alpha_env: std::array::from_fn(|i| self.cur_tev_alpha_env[i].raw()),
                 tev_orders: std::array::from_fn(|i| tev_orders[i].raw()),
@@ -195,13 +282,13 @@ impl GraphicsProcessor {
                 material_color: self.cached_material_color,
                 lights: self.cached_lights,
                 active_texcoords: (self.xf_mem[crate::flipper::gx::constants::XF_NUM_TEXGENS] as u8).min(8),
+                texgen_types: (0..8).fold(0, |types, i| {
+                    types | ((TexGenReg::from_raw(self.xf_mem[XF_TEXGEN_BASE + i]).texgen_type() as u32) << (i * 3))
+                }),
+                texcoord_scales: std::array::from_fn(|i| (self.bp_regs[BP_SU_SSIZE0 + i] & 0xffff) + 1),
                 ztex_bias: TevZtex1::from_raw(self.bp_regs[BP_TEV_ZTEX1]).bias(),
                 ztex_type: ztex2.tex_type(),
-                ztex_op: if self.cur_pe_control.early_ztest() {
-                    0
-                } else {
-                    ztex2.op()
-                },
+                ztex_op: self.effective_ztex_op(),
             }
         });
         self.frame_state_dirty = false;
@@ -223,6 +310,11 @@ impl GraphicsProcessor {
             });
             segment_base = segment_base.wrapping_add(entry.vertex_count as u32);
         }
+
+        self.skip_filter_data = skip_data;
+        self.skip_filter_entries = skip_entries;
+
+        renderer.inspect_draws(self, &self.draw_segments_scratch);
 
         renderer.exec_draw_batch(&self.draw_segments_scratch, state);
 
@@ -464,18 +556,13 @@ impl GraphicsProcessor {
         } else if vf.clr0_attr == AttributeType::Direct {
             let start = cur.position() as usize;
             cur.set_position(cur.position() + vf.clr0_data_size as u64);
-            decode_color(
-                &data[start..start + vf.clr0_data_size],
-                vf.vat_a.clr0_fmt(),
-                vf.vat_a.clr0_cnt(),
-            )
+            decode_color(&data[start..start + vf.clr0_data_size], vf.vat_a.clr0_fmt())
         } else {
             let clr0_index = read_index(cur, vf.clr0_attr);
             let clr0_addr = vf.clr0_base + clr0_index * vf.clr0_stride;
             decode_color(
                 fetch(ram, clr0_addr, vf.clr0_data_size, &mut scratch),
                 vf.vat_a.clr0_fmt(),
-                vf.vat_a.clr0_cnt(),
             )
         };
 
@@ -485,18 +572,13 @@ impl GraphicsProcessor {
         } else if vf.clr1_attr == AttributeType::Direct {
             let start = cur.position() as usize;
             cur.set_position(cur.position() + vf.clr1_data_size as u64);
-            decode_color(
-                &data[start..start + vf.clr1_data_size],
-                vf.vat_a.clr1_fmt(),
-                vf.vat_a.clr1_cnt(),
-            )
+            decode_color(&data[start..start + vf.clr1_data_size], vf.vat_a.clr1_fmt())
         } else {
             let clr1_index = read_index(cur, vf.clr1_attr);
             let clr1_addr = vf.clr1_base + clr1_index * vf.clr1_stride;
             decode_color(
                 fetch(ram, clr1_addr, vf.clr1_data_size, &mut scratch),
                 vf.vat_a.clr1_fmt(),
-                vf.vat_a.clr1_cnt(),
             )
         };
 
@@ -804,8 +886,7 @@ fn decode_components<const N: usize>(data: &[u8], num: usize, fmt: ComponentForm
     result
 }
 
-fn decode_color(data: &[u8], fmt: regs::ColorFormat, cnt: regs::ColorCount) -> [f32; 4] {
-    let has_alpha = cnt == regs::ColorCount::Rgba;
+fn decode_color(data: &[u8], fmt: regs::ColorFormat) -> [f32; 4] {
     match fmt {
         regs::ColorFormat::Rgb565 => {
             let raw = u16::from_be_bytes([data[0], data[1]]);
@@ -831,7 +912,7 @@ fn decode_color(data: &[u8], fmt: regs::ColorFormat, cnt: regs::ColorCount) -> [
             let r = ((raw >> 12) & 0xF) as f32 / 15.0;
             let g = ((raw >> 8) & 0xF) as f32 / 15.0;
             let b = ((raw >> 4) & 0xF) as f32 / 15.0;
-            let a = if has_alpha { (raw & 0xF) as f32 / 15.0 } else { 1.0 };
+            let a = (raw & 0xF) as f32 / 15.0;
             [r, g, b, a]
         }
         regs::ColorFormat::Rgba6 => {
@@ -839,14 +920,14 @@ fn decode_color(data: &[u8], fmt: regs::ColorFormat, cnt: regs::ColorCount) -> [
             let r = ((raw >> 18) & 0x3F) as f32 / 63.0;
             let g = ((raw >> 12) & 0x3F) as f32 / 63.0;
             let b = ((raw >> 6) & 0x3F) as f32 / 63.0;
-            let a = if has_alpha { (raw & 0x3F) as f32 / 63.0 } else { 1.0 };
+            let a = (raw & 0x3F) as f32 / 63.0;
             [r, g, b, a]
         }
         regs::ColorFormat::Rgba8 => {
             let r = data[0] as f32 / 255.0;
             let g = data[1] as f32 / 255.0;
             let b = data[2] as f32 / 255.0;
-            let a = if has_alpha { data[3] as f32 / 255.0 } else { 1.0 };
+            let a = data[3] as f32 / 255.0;
             [r, g, b, a]
         }
     }

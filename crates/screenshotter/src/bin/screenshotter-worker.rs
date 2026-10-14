@@ -1,4 +1,4 @@
-use backend_wgpu::sink::InlineSink;
+use backend_wgpu::sink::{InlineSink, TargetAspect};
 use backend_wgpu::{GxRenderer, capture};
 use gecko::HostInput;
 use gecko::flipper::si::pad;
@@ -10,33 +10,18 @@ use gecko::wii::Wii;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-const IPL: &[u8] = include_bytes!("../../../../private/IPL.decoded.bin");
-const DSP: &[u8] = include_bytes!("../../../../private/dsp_rom.bin");
-const COEF: &[u8] = include_bytes!("../../../../private/dsp_coef.bin");
-
-fn take_screenshot(device: &wgpu::Device, queue: &wgpu::Queue, gx: &GxRenderer, code: &str, frame: u32) {
+fn take_screenshot(device: &wgpu::Device, queue: &wgpu::Queue, gx: &GxRenderer, code: &str, frame: u32, is_wii: bool) {
     let _ = device.poll(wgpu::PollType::Wait {
         submission_index: None,
         timeout: None,
     });
 
-    let mut captured = capture::capture_texture(device, queue, &gx.xfb_texture).expect("capture_texture returned None");
-
-    for px in captured.rgba.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
+    let captured = capture::capture_texture(device, queue, &gx.xfb_texture)
+        .expect("capture_texture returned None")
+        .with_aspect(TargetAspect::auto(is_wii));
 
     let path = format!("screenshotdb/{}/{}.png", code, frame);
-    let file = std::fs::File::create(&path).expect("Failed to create PNG file");
-
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), captured.width, captured.height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-
-    let mut writer = encoder.write_header().expect("Failed to write PNG header");
-    writer
-        .write_image_data(&captured.rgba)
-        .expect("Failed to write PNG data");
+    capture::write_png(std::path::Path::new(&path), captured, true).expect("Failed to write PNG");
 }
 
 fn main() {
@@ -77,28 +62,26 @@ fn run_one(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::Tex
     let out_dir = format!("screenshotdb/{}", code);
     std::fs::create_dir_all(&out_dir).expect("Failed to create screenshotdb directory");
 
-    let log_file = std::fs::File::create(format!("{}/log.txt", out_dir)).expect("Failed to create log file");
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-    tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_env_filter(env_filter)
-        .with_writer(Mutex::new(log_file))
-        .init();
+    // let log_file = std::fs::File::create(format!("{}/log.txt", out_dir)).expect("Failed to create log file");
+    // let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+    //     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    // tracing_subscriber::fmt()
+    //     .without_time()
+    //     .with_ansi(false)
+    //     .with_env_filter(env_filter)
+    //     .with_writer(Mutex::new(log_file))
+    //     .init();
 
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        tracing::error!("{info}");
-        prev_hook(info);
-    }));
+    // let prev_hook = std::panic::take_hook();
+    // std::panic::set_hook(Box::new(move |info| {
+    //     tracing::error!("{info}");
+    //     prev_hook(info);
+    // }));
 
     let (gx, sink) = InlineSink::new(device.clone(), queue.clone(), surface_format);
 
     if is_wii {
         let mut wii = Wii::apploader_hle(image).build();
-        wii.dsp.load_irom(DSP);
-        wii.dsp.load_coef(COEF);
         wii.render_sink = Box::new(sink);
         drive(
             &mut wii,
@@ -110,11 +93,8 @@ fn run_one(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::Tex
             update_wii_input,
         );
     } else {
-        let mut gamecube = GameCube::with_ipl(IPL, true);
-        gamecube.dsp.load_irom(DSP);
-        gamecube.dsp.load_coef(COEF);
+        let mut gamecube = GameCube::with_ipl_hle(image);
         gamecube.render_sink = Box::new(sink);
-        gamecube.insert_dvd(image);
         drive(
             &mut gamecube,
             device,
@@ -151,7 +131,7 @@ fn drive<const SYSTEM: SystemId>(
     let mut frame: u32 = framerate * 2;
     {
         let g = gx.lock().unwrap();
-        take_screenshot(device, queue, &g, code, frame);
+        take_screenshot(device, queue, &g, code, frame, SYSTEM == gecko::system::WII);
     }
 
     for idx in 0..20 {
@@ -164,7 +144,7 @@ fn drive<const SYSTEM: SystemId>(
         }
 
         let g = gx.lock().unwrap();
-        take_screenshot(device, queue, &g, code, frame);
+        take_screenshot(device, queue, &g, code, frame, SYSTEM == gecko::system::WII);
     }
 }
 

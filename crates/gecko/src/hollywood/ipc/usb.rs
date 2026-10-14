@@ -67,6 +67,13 @@ impl IosDevice for Bluetooth {
         Bluetooth::set_wiimote_shake(self, active)
     }
 
+    fn set_wiimote_options(&mut self, attached: bool, sideways: bool) {
+        let attachment_changed = self.wiimote.set_options(attached, sideways);
+        if attachment_changed && self.host_hid_interrupt_cid.is_some() {
+            self.queue_hid_input_report(self.wiimote.make_status_report());
+        }
+    }
+
     fn set_wiimote_accel(&mut self, accel: Option<[f32; 3]>) {
         self.wiimote.set_accel(accel);
     }
@@ -98,21 +105,21 @@ impl IosDevice for Bluetooth {
 
 impl Bluetooth {
     fn handle_control(&mut self, ctx: &mut DeviceContext<'_>, vec_ptr: u32) -> i32 {
-        let bm_request = ctx.mmio.phys_read_u8(self::vec_data(ctx.mmio, vec_ptr, 0));
-        let b_request = ctx.mmio.phys_read_u8(self::vec_data(ctx.mmio, vec_ptr, 1));
+        let bm_request = ctx.mmio.phys_read_u8(super::vec_data(ctx.mmio, vec_ptr, 0));
+        let b_request = ctx.mmio.phys_read_u8(super::vec_data(ctx.mmio, vec_ptr, 1));
         if bm_request != 0x20 || b_request != 0 {
             return 0;
         }
 
         let w_length = {
-            let p = self::vec_data(ctx.mmio, vec_ptr, 4);
+            let p = super::vec_data(ctx.mmio, vec_ptr, 4);
             u16::from_le_bytes([ctx.mmio.phys_read_u8(p), ctx.mmio.phys_read_u8(p + 1)])
         };
         if w_length < 3 {
             return 0;
         }
 
-        let data_ptr = self::vec_data(ctx.mmio, vec_ptr, 6);
+        let data_ptr = super::vec_data(ctx.mmio, vec_ptr, 6);
         let packet = ctx.mmio.phys_slice(data_ptr, w_length as usize).to_vec();
         if packet.len() < 2 {
             return 0;
@@ -123,10 +130,10 @@ impl Bluetooth {
     }
 
     fn handle_bulk(&mut self, ctx: &mut DeviceContext<'_>, vec_ptr: u32) -> i32 {
-        let endpoint = ctx.mmio.phys_read_u8(self::vec_data(ctx.mmio, vec_ptr, 0));
-        let len_p = self::vec_data(ctx.mmio, vec_ptr, 1);
+        let endpoint = ctx.mmio.phys_read_u8(super::vec_data(ctx.mmio, vec_ptr, 0));
+        let len_p = super::vec_data(ctx.mmio, vec_ptr, 1);
         let w_length = u16::from_le_bytes([ctx.mmio.phys_read_u8(len_p), ctx.mmio.phys_read_u8(len_p + 1)]);
-        let buf_ptr = self::vec_data(ctx.mmio, vec_ptr, 2);
+        let buf_ptr = super::vec_data(ctx.mmio, vec_ptr, 2);
 
         match endpoint {
             EP_BULK_OUT => {
@@ -166,7 +173,7 @@ impl Bluetooth {
     /// HCI event receive (interrupt IN endpoint 0x81). Deliver the next
     /// queued event, or reply length 0 (the SDK seems to tolerate that).
     fn handle_interrupt(&mut self, ctx: &mut DeviceContext<'_>, vec_ptr: u32) -> i32 {
-        if ctx.mmio.phys_read_u8(self::vec_data(ctx.mmio, vec_ptr, 0)) != EP_INT_IN {
+        if ctx.mmio.phys_read_u8(super::vec_data(ctx.mmio, vec_ptr, 0)) != EP_INT_IN {
             return 0;
         }
 
@@ -174,7 +181,7 @@ impl Bluetooth {
             return 0;
         };
 
-        let buf_ptr = self::vec_data(ctx.mmio, vec_ptr, 2);
+        let buf_ptr = super::vec_data(ctx.mmio, vec_ptr, 2);
         ctx.mmio.phys_slice_mut(buf_ptr, event.len()).copy_from_slice(&event);
 
         tracing::debug!(
@@ -314,9 +321,4 @@ fn push_capped(queue: &mut VecDeque<Vec<u8>>, frame: Vec<u8>) {
     }
 
     queue.push_back(frame);
-}
-
-#[inline(always)]
-fn vec_data<const SYS: crate::system::SystemId>(mmio: &crate::mmio::Mmio<SYS>, vec_ptr: u32, idx: u32) -> u32 {
-    mmio.phys_read_u32(vec_ptr + (idx * 8))
 }

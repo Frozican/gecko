@@ -14,7 +14,7 @@ struct Args {
     #[arg(long)]
     ipl_hle: bool,
 
-    /// Path to DSP IROM binary
+    /// Path to DSP IROM binary (defaults to Dolphin's DSP ROM)
     #[arg(long)]
     dsp: Option<String>,
 

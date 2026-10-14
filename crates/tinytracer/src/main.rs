@@ -68,7 +68,7 @@ struct Args {
     #[arg(long)]
     no_ansi: bool,
 
-    /// Path to a DSP IROM binary
+    /// Path to a DSP IROM binary (defaults to Dolphin's DSP ROM)
     #[arg(long)]
     dsp: Option<String>,
 

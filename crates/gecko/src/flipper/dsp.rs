@@ -9,6 +9,11 @@ pub mod interpreter;
 pub mod jit;
 pub mod regs;
 
+// Dolphin's DSP IROM/coefficient replacement, used until a real dump is loaded
+// (see submodules/dolphin/docs/DSP/free_dsp_rom).
+pub static FREE_IROM: &[u8] = include_bytes!("../../../../submodules/dolphin/Data/Sys/GC/dsp_rom.bin");
+pub static FREE_COEF: &[u8] = include_bytes!("../../../../submodules/dolphin/Data/Sys/GC/dsp_coef.bin");
+
 #[allow(dead_code, unused_variables, non_upper_case_globals, clippy::all)]
 pub mod lut {
     include!(concat!(env!("OUT_DIR"), "/dsp_lut.rs"));
@@ -83,18 +88,45 @@ pub struct Dsp {
     wait_table: Box<[WaitCondition]>,
 
     pub scheduler_suspended: bool,
+    pub pending_exceptions: u8,
 }
 
 impl Dsp {
+    fn check_exceptions(&mut self) {
+        let external = self.csr.pi_interrupt() && self.registers.status.external_interrupt_enable();
+        let exception = if external {
+            self.csr.set_pi_interrupt(false);
+            7
+        } else if self.pending_exceptions != 0 && self.registers.status.interrupt_enable() {
+            let exception = 7 - self.pending_exceptions.leading_zeros() as u16;
+            self.pending_exceptions &= !(1 << exception);
+            exception
+        } else {
+            return;
+        };
+        self.registers.call_stack.push(self.registers.pc);
+        self.registers.data_stack.push(self.registers.status.raw());
+
+        if external {
+            self.registers.status.set_external_interrupt_enable(false);
+        } else {
+            self.registers.status.set_interrupt_enable(false);
+        }
+
+        self.registers.pc = exception * 2;
+    }
+
     pub fn new() -> Self {
         let aram = unsafe { Box::<[u8; 16 * 1024 * 1024]>::new_zeroed().assume_init() };
         let iram = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
-        let irom = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        let mut irom = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        irom[..FREE_IROM.len()].copy_from_slice(FREE_IROM);
         let dram = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
-        let coef = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        let mut coef = unsafe { Box::<[u8; 0x2000]>::new_zeroed().assume_init() };
+        coef[..FREE_COEF.len()].copy_from_slice(FREE_COEF);
         let ifx = unsafe { Box::<[u8; 0x200]>::new_zeroed().assume_init() };
 
-        Dsp {
+        let mut dsp = Dsp {
             registers: core::Registers::default(),
             iram,
             irom,
@@ -130,7 +162,10 @@ impl Dsp {
             instr_count: 0,
             wait_table: vec![WaitCondition::None; 0x10000].into_boxed_slice(),
             scheduler_suspended: false,
-        }
+            pending_exceptions: 0,
+        };
+        dsp.rebuild_wait_table();
+        dsp
     }
 
     #[inline(always)]
@@ -145,6 +180,10 @@ impl Dsp {
 
     #[inline(always)]
     pub fn parked_in_idle_wait(&self) -> bool {
+        if self.pending_exceptions != 0 && self.registers.status.interrupt_enable() {
+            return false;
+        }
+
         if self.csr.pi_interrupt() && self.registers.status.external_interrupt_enable() {
             return false;
         }
@@ -279,7 +318,7 @@ impl Dsp {
     }
 
     pub fn process_aram_dma<const SYSTEM: SystemId>(&mut self, mmio: &mut Mmio<SYSTEM>) {
-        let ram_addr = (self.aram_dma_mmio_addr.raw() & 0x3FFFFFFF) as usize;
+        let ram_addr = self.aram_dma_mmio_addr.raw() as usize;
         let aram_addr = self.aram_dma_aram_addr.raw() as usize;
         let count = self.aram_dma_control.count() as usize;
 
@@ -395,13 +434,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
             return false;
         }
 
-        if self.dsp.csr.pi_interrupt() && self.dsp.registers.status.external_interrupt_enable() {
-            self.dsp.csr = self.dsp.csr.with_pi_interrupt(false);
-            self.dsp.registers.call_stack.push(self.dsp.registers.pc);
-            self.dsp.registers.data_stack.push(self.dsp.registers.status.raw());
-            self.dsp.registers.status = self.dsp.registers.status.with_external_interrupt_enable(false);
-            self.dsp.registers.pc = 0x000E;
-        }
+        self.dsp.check_exceptions();
 
         let pc = self.dsp.registers.pc as usize;
         let w0 = self.dsp.read_imem(pc as u16);
@@ -442,6 +475,8 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     }
 
     pub fn execute_dsp_batch(&mut self) {
+        #[cfg(feature = "frame-timings")]
+        let _timer = crate::profile::frame_timings::Timer::new(crate::profile::frame_timings::Kind::DspRun);
         #[cfg(feature = "jit")]
         if self.execution_mode == ExecutionMode::Jit {
             self.execute_dsp_batch_jit();
@@ -451,6 +486,8 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     }
 
     pub fn drain_dsp_synchronous(&mut self, max_steps: u32) {
+        #[cfg(feature = "frame-timings")]
+        let _timer = crate::profile::frame_timings::Timer::new(crate::profile::frame_timings::Kind::DspRun);
         #[cfg(feature = "jit")]
         if self.execution_mode == ExecutionMode::Jit {
             self.drain_dsp_synchronous_jit(max_steps);
@@ -463,13 +500,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     fn dsp_jit_step(&mut self, iram: &[u8], irom: &[u8]) -> u64 {
         let ctx_ptr = self as *mut crate::system::System<SYSTEM> as *mut ::core::ffi::c_void;
 
-        if self.dsp.csr.pi_interrupt() && self.dsp.registers.status.external_interrupt_enable() {
-            self.dsp.csr = self.dsp.csr.with_pi_interrupt(false);
-            self.dsp.registers.call_stack.push(self.dsp.registers.pc);
-            self.dsp.registers.data_stack.push(self.dsp.registers.status.raw());
-            self.dsp.registers.status = self.dsp.registers.status.with_external_interrupt_enable(false);
-            self.dsp.registers.pc = 0x000E;
-        }
+        self.dsp.check_exceptions();
 
         let start_pc = self.dsp.registers.pc;
         self.dsp.chain_budget = DSP_JIT_CHAIN_BUDGET;
@@ -1068,9 +1099,12 @@ impl Dsp {
         self.aram_info = r.pod()?;
         self.aram_mode = r.pod()?;
         self.aram_refresh = r.pod()?;
-        self.aram_dma_mmio_addr = r.pod()?;
-        self.aram_dma_aram_addr = r.pod()?;
-        self.aram_dma_control = r.pod()?;
+        let aram_dma_mmio_addr: regs::AramDmaMmioAddr = r.pod()?;
+        let aram_dma_aram_addr: regs::AramDmaAramAddr = r.pod()?;
+        let aram_dma_control: regs::AramDmaControl = r.pod()?;
+        self.aram_dma_mmio_addr = regs::AramDmaMmioAddr::from_raw(aram_dma_mmio_addr.raw() & regs::ARAM_DMA_MASK);
+        self.aram_dma_aram_addr = regs::AramDmaAramAddr::from_raw(aram_dma_aram_addr.raw() & regs::ARAM_DMA_MASK);
+        self.aram_dma_control = regs::AramDmaControl::from_raw(aram_dma_control.raw() & regs::ARAM_DMA_CONTROL_MASK);
         self.audio_dma_start_addr = r.pod()?;
         self.audio_dma_control = r.pod()?;
 

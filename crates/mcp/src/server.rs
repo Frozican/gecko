@@ -249,9 +249,9 @@ impl McpServer {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             boot::boot(
                 bytes,
-                &self.shared.ipl,
-                &self.shared.dsp_rom,
-                &self.shared.coef_rom,
+                self.shared.ipl.as_deref(),
+                self.shared.dsp_rom.as_deref(),
+                self.shared.coef_rom.as_deref(),
                 self.shared.gx.clone(),
                 self.shared.device.clone(),
                 self.shared.queue.clone(),
@@ -454,6 +454,7 @@ impl McpServer {
     #[tool(description = "Capture the current frame from the emulator's XFB and return it as a base64 PNG.")]
     async fn get_view(&self) -> Result<CallToolResult, McpError> {
         require_loaded(&self.shared)?;
+        let is_wii = matches!(self.shared.state.lock().unwrap().backend, Some(Backend::Wii(_)));
         let _ = self.shared.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
@@ -462,6 +463,7 @@ impl McpServer {
             let gx = self.shared.gx.lock().unwrap();
             backend_wgpu::capture::capture_texture(&self.shared.device, &self.shared.queue, &gx.xfb_texture)
                 .ok_or_else(|| McpError::internal_error("capture_texture returned None", None))?
+                .with_aspect(backend_wgpu::sink::TargetAspect::auto(is_wii))
         };
         let mut rgba = captured.rgba;
         for px in rgba.chunks_exact_mut(4) {
@@ -507,7 +509,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Return one previously uploaded GX texture as a base64 PNG. Identify by ram_addr (and variant for paletted textures)."
+        description = "Return one previously uploaded GX texture as a base64 PNG. Identify by ram_addr and the variant returned by the texture list."
     )]
     async fn get_texture(&self, Parameters(args): Parameters<GetTextureArgs>) -> Result<CallToolResult, McpError> {
         let intro = self.shared.introspect.lock().unwrap();
@@ -525,7 +527,10 @@ impl McpServer {
                 None,
             )
         })?;
-        let png = encode_png(rec.width, rec.height, &rec.rgba)?;
+        let rgba = rec.data.as_ref().map_or_else(Vec::new, |data| {
+            data.decode_base_level(rec.width, rec.height, rec.format)
+        });
+        let png = encode_png(rec.width, rec.height, &rgba)?;
         ok_json(&json!({
             "ram_addr": args.ram_addr,
             "variant": key.variant,
@@ -585,6 +590,8 @@ impl McpServer {
     async fn set_wiimote(&self, Parameters(args): Parameters<SetWiimoteArgs>) -> Result<CallToolResult, McpError> {
         require_loaded(&self.shared)?;
         let input = gecko::HostInput::Wii {
+            nunchuk_attached: true,
+            sideways: false,
             wiimote_buttons: args.buttons.unwrap_or(0),
             wiimote_shake: args.shake.unwrap_or(false),
             nunchuk_buttons: args.nunchuk_buttons.unwrap_or(0),

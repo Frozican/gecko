@@ -110,6 +110,12 @@ pub const BP_TX_SETTLUT_I4: usize = 0xB8; // TX_SETTLUT maps 4-7
 // register), LOAD_TLUT1 triggers the copy and carries tmem_offset / count.
 pub const BP_LOAD_TLUT0: usize = 0x64;
 pub const BP_LOAD_TLUT1: usize = 0x65;
+pub const BP_PRELOAD_ADDR: usize = 0x60;
+pub const BP_PRELOAD_TMEM_EVEN: usize = 0x61;
+pub const BP_PRELOAD_TMEM_ODD: usize = 0x62;
+pub const BP_PRELOAD_MODE: usize = 0x63;
+pub const TMEM_SIZE: usize = dff::TEX_MEM_SIZE;
+pub const TMEM_LINE_SIZE: usize = 32;
 
 // Palette TMEM layout: tmem_offset is in 256-entry (512-byte) units.
 pub const TLUT_ENTRIES_PER_UNIT: usize = 256;
@@ -121,6 +127,7 @@ pub const TLUT_MEM_ENTRIES: usize = 1024 * TLUT_ENTRIES_PER_UNIT;
 // BP PE (Pixel Engine) registers
 pub const BP_PE_ZMODE: usize = 0x40;
 pub const BP_PE_CMODE0: usize = 0x41; // blend mode
+pub const BP_PE_CMODE1: usize = 0x42; // destination alpha
 pub const BP_PE_ZCOMPARE: usize = 0x43;
 pub const BP_PE_ALPHA_COMPARE: usize = 0xF3;
 pub const BP_TEV_ZTEX1: usize = 0xF4; // Z-texture bias (24-bit)
@@ -177,6 +184,8 @@ pub const XF_VIEWPORT_END: usize = 0x101F;
 // BP scissor registers
 pub const BP_SU_SCIS_TL: usize = 0x20;
 pub const BP_SU_SCIS_BR: usize = 0x21;
+pub const BP_SU_SSIZE0: usize = 0x30;
+pub const BP_SU_SIZE_END: usize = 0x40;
 pub const BP_SU_SCIS_OFFSET: usize = 0x59;
 
 // BP EFB copy registers

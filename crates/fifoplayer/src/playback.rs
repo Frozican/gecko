@@ -1,14 +1,17 @@
-use gecko::flipper::gx::constants::{BP_REG_SIZE, CP_REG_SIZE};
+use gecko::flipper::gx::constants::{BP_LOAD_TLUT1, BP_PRELOAD_MODE, BP_REG_SIZE, CP_REG_SIZE};
 use gecko::flipper::gx::{GraphicsProcessor, texture};
-use gecko::host::{DrawData, DrawVertex, GxAction, RenderSink, XfbPart};
+use gecko::host::{DrawData, DrawSegment, DrawVertex, GxAction, RenderSink, XfbPart};
 use gecko::mmio::{Mmio, RamViewMut};
 use gecko::system::SystemId;
 
-const BP_RESTORE_SKIP: &[usize] = &[0x45, 0x47, 0x48, 0x52, 0x65, 0xFE];
+const BP_RESTORE_SKIP: &[usize] = &[0x45, 0x47, 0x48, 0x52, BP_PRELOAD_MODE, BP_LOAD_TLUT1, 0xFE];
 
 pub struct PlayerSink {
     inner: Box<dyn RenderSink>,
     xfb_heights: Vec<(u32, u32)>,
+    pub inspection: Option<crate::debug::geometry::GeometryCapture>,
+    pub depth_request: Option<(crate::debug::geometry::DrawLocation, usize)>,
+    next_subdraw: usize,
 }
 
 impl PlayerSink {
@@ -16,15 +19,54 @@ impl PlayerSink {
         PlayerSink {
             inner,
             xfb_heights: Vec::new(),
+            inspection: None,
+            depth_request: None,
+            next_subdraw: 0,
         }
     }
 }
 
 impl RenderSink for PlayerSink {
+    fn capture_efb_depth(&mut self) -> Option<Vec<u32>> {
+        self.inner.capture_efb_depth()
+    }
+
+    fn inspect_draws(&mut self, gx: &GraphicsProcessor, segments: &[DrawSegment]) {
+        let Some(capture) = &mut self.inspection else {
+            return;
+        };
+
+        let verts = self.inner.vertex_scratch();
+        self.next_subdraw = capture.draws.get(&capture.location.offset).map_or(0, Vec::len);
+
+        for seg in segments {
+            let first = seg.base_vertex as usize;
+            capture.record(gx, seg.primitive, &verts[first..first + seg.vertex_count as usize]);
+        }
+    }
+
     fn exec(&mut self, action: GxAction) {
+        if let GxAction::Draw(data) = &action {
+            if let Some(capture) = &self.inspection
+                && self.depth_request == Some((capture.location, self.next_subdraw))
+                && let Some(draw) = capture
+                    .draws
+                    .get(&capture.location.offset)
+                    .and_then(|v| v.get(self.next_subdraw))
+            {
+                let _ = draw.depth_before.set(self.inner.capture_efb_depth());
+            }
+            self.next_subdraw += data.segments.len();
+        }
+
+        if let Some(capture) = &mut self.inspection {
+            capture.action(&action);
+        }
+
         if let GxAction::CopyXfb { id, dst_h, .. } = &action {
             self.xfb_heights.push((*id, *dst_h));
         }
+
         self.inner.exec(action);
     }
 
@@ -59,14 +101,7 @@ impl<const SYSTEM: SystemId> Playback<SYSTEM> {
     }
 
     pub fn load_state(&mut self, file: &dff::DffFile, sink: &mut PlayerSink) {
-        for (i, entry) in self.gx.palette_mem.iter_mut().enumerate() {
-            let off = i * 2;
-            if off + 2 > file.tex_mem.len() {
-                break;
-            }
-
-            *entry = u16::from_be_bytes([file.tex_mem[off], file.tex_mem[off + 1]]);
-        }
+        self.gx.load_tmem(&file.tex_mem);
 
         let mut stream: Vec<u8> = Vec::with_capacity(32 * 1024);
 
@@ -110,13 +145,10 @@ impl<const SYSTEM: SystemId> Playback<SYSTEM> {
     }
 
     pub fn play_frame(&mut self, frame: &dff::Frame, sink: &mut PlayerSink) -> bool {
-        self.play_frame_with(&frame.fifo_data, &frame.memory_updates, sink)
-    }
-
-    pub fn play_frame_with(&mut self, fifo_data: &[u8], updates: &[dff::MemoryUpdate], sink: &mut PlayerSink) -> bool {
+        let fifo_data = &frame.fifo_data;
         let mut pos = 0usize;
 
-        for update in updates {
+        for update in &frame.memory_updates {
             let p = (update.fifo_position as usize).min(fifo_data.len());
             if p > pos {
                 self.feed(&fifo_data[pos..p], sink);

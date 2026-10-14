@@ -106,7 +106,8 @@ impl Freecam {
 }
 
 fn texture_preview(ui: &mut egui::Ui, tex: &TextureDescriptor, ram: &[u8], palette: &[u16], tlut: TlutRef) {
-    let rgba = gecko::flipper::gx::texture::decode_to_rgba(ram, tex, palette, tlut.format);
+    let rgba =
+        gecko::flipper::gx::texture::decode_to_rgba(ram, tex.width, tex.height, tex.format, palette, tlut.format);
     let size = [tex.width as usize, tex.height as usize];
     let image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
     let handle = ui.ctx().load_texture(
@@ -288,7 +289,7 @@ pub fn show_gx<const SYSTEM: SystemId>(
                         );
                         let tlut = gx.cur_tluts[slot];
                         let base = (tlut.tmem_offset as usize) * 256;
-                        let palette = gx.palette_mem.get(base..).unwrap_or(&[]);
+                        let palette = gx.tmem.get(base..).unwrap_or(&[]);
                         ui.collapsing(heading, |ui| {
                             texture_preview(ui, tex, &mmio.ram, palette, tlut);
                         });

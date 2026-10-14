@@ -39,19 +39,28 @@ pub enum TargetAspect {
 }
 
 impl TargetAspect {
+    pub fn auto(is_wii: bool) -> Self {
+        if is_wii {
+            TargetAspect::Ratio(16.0 / 9.0)
+        } else {
+            TargetAspect::Ratio(4.0 / 3.0)
+        }
+    }
+
     pub fn from_arg(arg: &str, is_wii: bool) -> Self {
         match arg {
-            "auto" => {
-                if is_wii {
-                    TargetAspect::Ratio(16.0 / 9.0)
-                } else {
-                    TargetAspect::Ratio(4.0 / 3.0)
-                }
-            }
+            "auto" => Self::auto(is_wii),
             "4:3" => TargetAspect::Ratio(4.0 / 3.0),
             "16:9" => TargetAspect::Ratio(16.0 / 9.0),
             "stretch" => TargetAspect::Stretch,
             other => panic!("--aspect must be auto|4:3|16:9|stretch, got {other:?}"),
+        }
+    }
+
+    pub fn is_widescreen(self) -> bool {
+        match self {
+            TargetAspect::Ratio(ratio) => ratio > 4.0 / 3.0,
+            TargetAspect::Stretch => true,
         }
     }
 }
@@ -77,7 +86,7 @@ struct PendingEfbTexture {
     end: u32,
     width: u32,
     height: u32,
-    format: gecko::flipper::gx::draw::TextureFormat,
+    format: gecko::flipper::gx::texture::CopyFormat,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -112,6 +121,7 @@ struct EfbDrainRequest {
 
 #[cfg(not(target_arch = "wasm32"))]
 enum WorkerCommand {
+    LoadTexturePack(Box<crate::texture_pack::TexturePack>),
     Actions(ActionBatch),
     DrainEfbCopies(EfbDrainRequest),
     PeekEfbDepth {
@@ -128,6 +138,7 @@ impl RenderWorker {
     fn run(mut self, work_rx: crossbeam_channel::Receiver<WorkerCommand>) {
         while let Ok(command) = work_rx.recv() {
             match command {
+                WorkerCommand::LoadTexturePack(pack) => self.gx.texture_pack = *pack,
                 WorkerCommand::Actions(batch) => self.exec_batch(batch),
                 WorkerCommand::DrainEfbCopies(request) => self.drain_efb_copies(request),
                 WorkerCommand::PeekEfbDepth {
@@ -279,8 +290,14 @@ impl RenderWorker {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ThreadedSink {
+    /// Configure replacements before attaching this sink to an emulator.
+    pub fn load_texture_pack(&self, root: &std::path::Path, game_id: &str) {
+        let pack = crate::texture_pack::TexturePack::discover(root, game_id);
+        let _ = self.work_tx.send(WorkerCommand::LoadTexturePack(Box::new(pack)));
+    }
+
     fn reclaim_batch(&mut self) {
-        if !self.pending_actions.is_empty() || !self.scratch.is_empty() {
+        if self.pending_actions.capacity() != 0 || self.scratch.capacity() != 0 {
             return;
         }
 
@@ -394,11 +411,11 @@ impl RenderSink for ThreadedSink {
                         end,
                         width,
                         height,
-                        format: format.base_texture_format(),
+                        format,
                     });
                 }
             }
-        } else if matches!(&action, GxAction::InvalidateCaches) {
+        } else if matches!(&action, GxAction::InvalidateStateCaches | GxAction::InvalidateCaches) {
             self.pending_efb_textures.clear();
         }
 
@@ -448,9 +465,13 @@ impl RenderSink for ThreadedSink {
         height: u32,
         fmt: gecko::flipper::gx::draw::TextureFormat,
     ) -> bool {
-        self.pending_efb_textures
-            .iter()
-            .any(|copy| copy.addr == addr && copy.width == width && copy.height == height && copy.format == fmt)
+        self.pending_efb_textures.iter().any(|copy| {
+            copy.addr == addr
+                && copy.width == width
+                && copy.height == height
+                && (copy.format.base_texture_format() == fmt
+                    || (copy.format.is_palette_index() && fmt == gecko::flipper::gx::draw::TextureFormat::CI8))
+        })
     }
 
     fn flush_efb_copies(&mut self, ram: &mut gecko::mmio::RamViewMut<'_>) {
@@ -565,6 +586,10 @@ impl InlineSink {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RenderSink for InlineSink {
+    fn capture_efb_depth(&mut self) -> Option<Vec<u32>> {
+        self.gx.lock().unwrap().capture_efb_depth(&self.device, &self.queue)
+    }
+
     fn peek_efb_depth(&mut self, x: u32, y: u32) -> u32 {
         let mut gx = self.gx.lock().unwrap();
         let depth = gx.peek_efb_depth(&self.device, &self.queue, x, y);
@@ -608,7 +633,8 @@ impl RenderSink for InlineSink {
 
 pub fn action_resets_vertex_scratch(action: &GxAction) -> bool {
     match action {
-        GxAction::InvalidateCaches
+        GxAction::InvalidateStateCaches
+        | GxAction::InvalidateCaches
         | GxAction::CopyXfb { .. }
         | GxAction::PresentXfb { .. }
         | GxAction::PresentRawXfb { .. }
@@ -629,6 +655,7 @@ pub struct Renderer {
     blit_bind_group_layout: wgpu::BindGroupLayout,
     blit_sampler: wgpu::Sampler,
     target_aspect: TargetAspect,
+    last_target_size: Arc<Mutex<Option<(u32, u32)>>>,
     frame_ready_cb: Arc<OnceLock<FrameReadyCallback>>,
     #[cfg(feature = "renderdoc-capture")]
     renderdoc: Arc<Mutex<crate::renderdoc_capture::RenderDocCapture>>,
@@ -765,6 +792,7 @@ impl Renderer {
             blit_bind_group_layout,
             blit_sampler,
             target_aspect,
+            last_target_size: Arc::new(Mutex::new(None)),
             frame_ready_cb,
             #[cfg(feature = "renderdoc-capture")]
             renderdoc,
@@ -816,7 +844,11 @@ impl Renderer {
     /// resolution times the EFB scale. Blocks until the GPU copy completes.
     pub fn capture_xfb(&self) -> Option<crate::capture::CapturedFrame> {
         let texture = self.shared.output.lock().unwrap().clone();
-        crate::capture::capture_texture(&self.device, &self.queue, &texture)
+        let aspect = match (self.target_aspect, *self.last_target_size.lock().unwrap()) {
+            (TargetAspect::Stretch, Some((width, height))) => TargetAspect::Ratio(width as f32 / height as f32),
+            (aspect, _) => aspect,
+        };
+        crate::capture::capture_texture(&self.device, &self.queue, &texture).map(|frame| frame.with_aspect(aspect))
     }
 
     /// Blit the latest XFB output to the given render target. `target_size`
@@ -846,6 +878,7 @@ impl Renderer {
         target_size: (u32, u32),
         load: wgpu::LoadOp<wgpu::Color>,
     ) {
+        *self.last_target_size.lock().unwrap() = Some((target_size.0.max(1), target_size.1.max(1)));
         let output = self.shared.output.lock().unwrap().clone();
         let view = output.create_view(&Default::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {

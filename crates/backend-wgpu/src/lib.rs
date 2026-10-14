@@ -4,12 +4,16 @@ mod clear;
 #[cfg(not(target_arch = "wasm32"))]
 mod dump;
 mod helpers;
+mod palette;
 mod pipeline;
 mod render;
 #[cfg(feature = "renderdoc-capture")]
 mod renderdoc_capture;
 mod shader_specialization;
 pub mod sink;
+mod texture_decode;
+#[cfg(not(target_arch = "wasm32"))]
+mod texture_pack;
 
 use gecko::common::Address;
 #[cfg(feature = "renderdoc-capture")]
@@ -20,9 +24,7 @@ use gecko::flipper::gx::regs::{AlphaCompare, BlendMode, CompareFunc, CullMode, M
 use gecko::host::{DrawState, TextureKey};
 use glam::Mat4;
 use pipeline::{FullPipelineKey, UberPipelineKey};
-use rustc_hash::FxHashMap;
-#[cfg(not(target_arch = "wasm32"))]
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shader_specialization::{ShaderKey, ShaderSpecializationKey};
 use std::num::NonZeroU64;
 #[cfg(feature = "gx-stats")]
@@ -109,6 +111,11 @@ impl RendererStats {
     }
 }
 
+pub(crate) const LOAD_TEXTURE_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::TEXTURE_BINDING
+    .union(wgpu::TextureUsages::STORAGE_BINDING)
+    .union(wgpu::TextureUsages::COPY_DST)
+    .union(wgpu::TextureUsages::COPY_SRC);
+
 pub(crate) fn align_up(value: u64, alignment: u64) -> u64 {
     (value + alignment - 1) & !(alignment - 1)
 }
@@ -139,7 +146,15 @@ pub(crate) fn compute_draw_buffer_layout(
     }
 }
 
-type SamplerKey = (WrapMode, WrapMode, MagFilter, MinFilter);
+type SamplerKey = (WrapMode, WrapMode, MagFilter, MinFilter, u8, u8);
+const DEFAULT_SAMPLER_KEY: SamplerKey = (
+    WrapMode::Clamp,
+    WrapMode::Clamp,
+    MagFilter::Linear,
+    MinFilter::Linear,
+    0,
+    0,
+);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BindGroupCacheKey {
@@ -173,7 +188,7 @@ pub(crate) struct FrameUniforms {
     pub indirect_refs: u32,
     pub num_indirect_stages: u32,
     pub bump_imask: u32,
-    pub _pad1: u32,
+    pub texgen_types: u32,
     // Per-TEV-stage IND_CMD, packed four per UVec4.
     pub tev_indirect: [glam::UVec4; 4],
     pub light_colors: [glam::Vec4; 8],
@@ -190,19 +205,21 @@ pub(crate) struct FrameUniforms {
     pub material_color0: glam::Vec4,
     pub material_color1: glam::Vec4,
     // Z-texture state: bias (24-bit), texel format (0=u8/1=u16/2=u24) and
-    // op (0=disabled, 1=add, 2=replace). Consumed by the fs_main_ztex entry
+    // op (0=disabled, 1=add, 2=replace). Consumed by the fs_main_depth entry
     // point, which derives the fragment depth from the last texture lookup.
     pub ztex_bias: u32,
     pub ztex_type: u32,
     pub ztex_op: u32,
-    pub _pad2: u32,
+    pub dst_alpha: u32,
+    pub zfreeze_plane: glam::Vec4,
+    pub texcoord_scales: [glam::UVec4; 4],
 }
 
 pub(crate) const FRAME_UNIFORMS_SIZE: NonZeroU64 = match NonZeroU64::new(std::mem::size_of::<FrameUniforms>() as u64) {
     Some(v) => v,
     None => panic!("FrameUniforms must be non-zero sized"),
 };
-const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 1552);
+const _: () = assert!(std::mem::size_of::<FrameUniforms>() == 1632);
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -210,9 +227,10 @@ pub(crate) struct DrawUniforms {
     pub mvp: glam::Mat4,
     /// Guest texture dimensions for texmaps 0-7, two slots per
     /// vector (slot i at `tex_dims[i / 2]`, xy for even i, zw for odd).
-    /// Indirect texturing needs these instead of `textureDimensions`
+    /// Texture-coordinate scaling needs these instead of `textureDimensions`
     /// because scaled EFB copies bind a larger GPU texture.
     pub tex_dims: [glam::UVec4; 4],
+    pub tex_lod_bias: [f32; 8],
 }
 
 pub(crate) const DRAW_UNIFORMS_SIZE: NonZeroU64 = match NonZeroU64::new(std::mem::size_of::<DrawUniforms>() as u64) {
@@ -225,6 +243,14 @@ pub const EFB_HEIGHT: u32 = 528;
 pub const EFB_SAMPLE_COUNT: u32 = 4;
 pub const MAX_EFB_SCALE: u32 = 4;
 
+pub(crate) struct CachedTexture {
+    pub(crate) fmt: TextureFormat,
+    pub(crate) native_w: u32,
+    pub(crate) native_h: u32,
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) view: wgpu::TextureView,
+}
+
 pub(crate) struct EfbCopyEntry {
     pub(crate) format: gecko::flipper::gx::texture::CopyFormat,
     /// Guest dimensions. The GPU texture itself is `efb_scale`
@@ -233,6 +259,7 @@ pub(crate) struct EfbCopyEntry {
     pub(crate) native_h: u32,
     pub(crate) texture: wgpu::Texture,
     pub(crate) view: wgpu::TextureView,
+    pub(crate) palette_source: Option<wgpu::Texture>,
 }
 
 impl EfbCopyEntry {
@@ -285,14 +312,17 @@ pub struct GxRenderer {
     // EFB: multisampled (4x) color, actual render target for draws.
     pub(crate) _efb_msaa_texture: wgpu::Texture,
     pub(crate) efb_msaa_view: wgpu::TextureView,
-    // EFB: multisampled (4x) depth.
+    // EFB: multisampled (4x) reversed depth (near = 1, far = 0).
     pub(crate) efb_depth_view: wgpu::TextureView,
     pub(crate) efb_needs_clear: bool,
-    pub(crate) sampler_cache: FxHashMap<(WrapMode, WrapMode, MagFilter, MinFilter), wgpu::Sampler>,
-    pub(crate) texture_cache: FxHashMap<TextureKey, (TextureFormat, wgpu::Texture, wgpu::TextureView)>,
-    // Retired LoadTexture allocations grouped by (w, h).
-    pub(crate) texture_pool: FxHashMap<(u32, u32), Vec<wgpu::Texture>>,
+    pub(crate) sampler_cache: FxHashMap<SamplerKey, wgpu::Sampler>,
+    pub(crate) texture_cache: FxHashMap<TextureKey, CachedTexture>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) texture_pack: texture_pack::TexturePack,
+    // Retired LoadTexture allocations grouped by (w, h, mip levels).
+    pub(crate) texture_pool: FxHashMap<(u32, u32, u32), Vec<wgpu::Texture>>,
     pub(crate) efb_copy_cache: FxHashMap<Address, EfbCopyEntry>,
+    pub(crate) palette_converter: palette::PaletteConverter,
     pub(crate) efb_copy_pool: FxHashMap<(u32, u32), Vec<(wgpu::Texture, wgpu::TextureView)>>,
     pub(crate) efb_pack_pipelines: render::EfbPackPipelines,
     pub(crate) efb_depth_pack_pipelines: render::EfbDepthPackPipelines,
@@ -310,6 +340,7 @@ pub struct GxRenderer {
     pub(crate) scratch_vertices: Vec<GpuVertex>,
     pub(crate) scratch_draws: Vec<DrawRecord>,
     pub(crate) scratch_uniform_bytes: Vec<u8>,
+    pub(crate) scratch_vertex_bytes: Vec<u8>,
     pub(crate) bind_group_cache: FxHashMap<BindGroupCacheKey, wgpu::BindGroup>,
     // Per-frame draw accumulation (persists across process_action calls,
     // flushed by flush_pending_draws).
@@ -347,6 +378,7 @@ pub struct GxRenderer {
     pub(crate) draw_fast_path_compatible: bool,
     pub(crate) current_texture_ids: [Option<TextureKey>; 8],
     pub(crate) current_sampler_keys: [Option<SamplerKey>; 8],
+    pub(crate) current_lod_bias: [f32; 8],
     // XFB output texture: composited from per-copy snapshots by PresentXfb.
     pub xfb_texture: wgpu::Texture,
     pub xfb_view: wgpu::TextureView,
@@ -361,18 +393,12 @@ pub struct GxRenderer {
     // Region-scoped EFB clear.
     pub(crate) efb_clear: clear::EfbClear,
     pub(crate) pending_command_buffers: Vec<wgpu::CommandBuffer>,
-    /// Shared staging buffer for `LoadTexture` uploads. Each upload appends
-    /// padded RGBA into `texture_staging_scratch` and records a
-    /// `copy_buffer_to_texture` into the persistent encoder; at submit time
-    /// the whole scratch is shipped through one `write_buffer_with` call.
+    pub(crate) texture_decoder: texture_decode::TextureDecoder,
+    /// Shared storage buffer for raw texture bytes, palettes and decode
+    /// parameters. All staged input is uploaded once at submission time.
     pub(crate) texture_staging_buffer: wgpu::Buffer,
     pub(crate) texture_staging_capacity: u64,
     pub(crate) texture_staging_scratch: Vec<u8>,
-    /// Largest scratch size observed within the current run. Used at submit
-    /// boundaries to decide whether to grow [`Self::texture_staging_buffer`]
-    /// for the next frame (so growth never invalidates a buffer the
-    /// in-flight encoder still references).
-    pub(crate) texture_staging_peak: u64,
     /// Persistent encoder accumulating GPU commands across operations within
     /// a frame.
     pub(crate) current_encoder: Option<wgpu::CommandEncoder>,
@@ -421,6 +447,7 @@ pub(crate) struct PendingWriteback {
     pub copy_format: gecko::flipper::gx::texture::CopyFormat,
     pub stride: u32,
     pub swap_bgra: bool,
+    pub force_opaque: bool,
 }
 
 impl GxRenderer {
@@ -527,6 +554,7 @@ impl GxRenderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            lod_max_clamp: 0.0,
             ..Default::default()
         });
 
@@ -585,7 +613,7 @@ impl GxRenderer {
         let texture_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gx_texture_staging"),
             size: initial_texture_staging_capacity,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
@@ -899,6 +927,7 @@ impl GxRenderer {
             r8: depth_pack("efb_depth_pack_r8", "fs_r8"),
             rg8: depth_pack("efb_depth_pack_rg8", "fs_rg8"),
         };
+        let palette_converter = palette::PaletteConverter::new(device, pack_formats_wgsl, make_pack_pipeline);
         let efb_clear = clear::EfbClear::new(
             device,
             surface_format,
@@ -953,15 +982,15 @@ impl GxRenderer {
             efb_needs_clear: true,
             sampler_cache: {
                 let mut m = FxHashMap::default();
-                m.insert(
-                    (WrapMode::Clamp, WrapMode::Clamp, MagFilter::Linear, MinFilter::Linear),
-                    sampler,
-                );
+                m.insert(DEFAULT_SAMPLER_KEY, sampler);
                 m
             },
             texture_cache: FxHashMap::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            texture_pack: texture_pack::TexturePack::default(),
             texture_pool: FxHashMap::default(),
             efb_copy_cache: FxHashMap::default(),
+            palette_converter,
             efb_copy_pool: FxHashMap::default(),
             efb_pack_pipelines,
             efb_depth_pack_pipelines,
@@ -973,6 +1002,7 @@ impl GxRenderer {
             scratch_vertices: Vec::new(),
             scratch_draws: Vec::new(),
             scratch_uniform_bytes: Vec::new(),
+            scratch_vertex_bytes: Vec::new(),
             bind_group_cache: FxHashMap::default(),
             frame_uniform_bytes: Vec::new(),
             draw_pipeline_keys: Vec::new(),
@@ -1006,6 +1036,7 @@ impl GxRenderer {
             draw_fast_path_compatible: false,
             current_texture_ids: Default::default(),
             current_sampler_keys: Default::default(),
+            current_lod_bias: [0.0; 8],
             xfb_texture,
             xfb_view,
             xfb_has_content: false,
@@ -1017,10 +1048,10 @@ impl GxRenderer {
             efb_color_readback_bind_group,
             efb_clear,
             pending_command_buffers: Vec::with_capacity(8),
+            texture_decoder: texture_decode::TextureDecoder::new(device),
             texture_staging_buffer,
             texture_staging_capacity: initial_texture_staging_capacity,
             texture_staging_scratch: Vec::with_capacity(initial_texture_staging_capacity as usize / 4),
-            texture_staging_peak: 0,
             current_encoder: None,
             draw_bufs_write_pending: false,
             xfb_copy_uniform_write_pending: false,
@@ -1092,10 +1123,10 @@ impl GxRenderer {
     }
 
     pub(crate) fn submit_pending(&mut self, queue: &wgpu::Queue) -> Option<wgpu::SubmissionIndex> {
-        // Ship any staged texture-upload bytes through ONE `write_buffer_with`
+        // Ship any staged texture-decode input through ONE `write_buffer_with`
         // before finishing the encoder. wgpu orders queue writes ahead of
-        // submitted commands, so the encoder's `copy_buffer_to_texture`
-        // commands (recorded earlier with offsets into this buffer) will
+        // submitted commands, so the encoder's compute decode dispatches
+        // (recorded earlier with offsets into this buffer) will
         // read the freshly-written data.
         if !self.texture_staging_scratch.is_empty()
             && let Some(size) = std::num::NonZeroU64::new(self.texture_staging_scratch.len() as u64)
@@ -1143,84 +1174,14 @@ impl GxRenderer {
         Some(submission_index)
     }
 
-    /// Append `rgba` (W*H*4 tight, no row padding) into
-    /// [`Self::texture_staging_scratch`] with COPY_BYTES_PER_ROW_ALIGNMENT
-    /// (256 bytes) row padding, and record a `copy_buffer_to_texture` into the
-    /// persistent encoder that copies the staged bytes into `dest`.
-    /// Returns `false` if the upload won't fit the current staging capacity.
-    /// Caller should fall back to `queue.write_texture` for that upload
-    /// and rely on the next submit boundary to grow the buffer via
-    /// [`Self::maybe_grow_texture_staging`].
-    pub(crate) fn stage_texture_upload(
-        &mut self,
-        device: &wgpu::Device,
-        dest: &wgpu::Texture,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-    ) -> bool {
-        const ROW_ALIGNMENT: u64 = 256;
-        const COPY_BUFFER_ALIGNMENT: u64 = 4;
-        let row_bytes = (width as u64) * 4;
-        let padded_row_bytes = align_up(row_bytes, ROW_ALIGNMENT);
-        let upload_size = padded_row_bytes * height as u64;
-        let offset = align_up(self.texture_staging_scratch.len() as u64, COPY_BUFFER_ALIGNMENT);
-        let end = offset + upload_size;
-        self.texture_staging_peak = self.texture_staging_peak.max(end);
-        if end > self.texture_staging_capacity {
-            return false;
-        }
-
-        // Pad to aligned start offset, then append each row + per-row padding.
-        self.texture_staging_scratch.resize(offset as usize, 0);
-        let pad = (padded_row_bytes - row_bytes) as usize;
-        for row in 0..height as usize {
-            let src_start = row * row_bytes as usize;
-            let src_end = src_start + row_bytes as usize;
-            self.texture_staging_scratch
-                .extend_from_slice(&rgba[src_start..src_end]);
-            if pad > 0 {
-                let new_len = self.texture_staging_scratch.len() + pad;
-                self.texture_staging_scratch.resize(new_len, 0);
-            }
-        }
-
-        let mut encoder = self.take_or_create_encoder(device);
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: &self.texture_staging_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset,
-                    bytes_per_row: Some(padded_row_bytes as u32),
-                    rows_per_image: None,
-                },
-            },
-            dest.as_image_copy(),
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.current_encoder = Some(encoder);
-        true
-    }
-
-    /// If the per-frame staging peak has exceeded the buffer's capacity,
-    /// reallocate (next power of two of peak). Safe to call only when no
-    /// encoder commands reference the existing buffer.
-    pub(crate) fn maybe_grow_texture_staging(&mut self, device: &wgpu::Device) {
-        if self.texture_staging_peak <= self.texture_staging_capacity {
-            return;
-        }
-        let new_cap = self
-            .texture_staging_peak
-            .next_power_of_two()
-            .max(self.texture_staging_peak);
+    /// Reallocate the staging buffer to fit `needed` bytes. Safe to call only
+    /// when no encoder commands reference the existing buffer.
+    pub(crate) fn grow_texture_staging(&mut self, device: &wgpu::Device, needed: u64) {
+        let new_cap = needed.next_power_of_two().min(device.limits().max_buffer_size);
         self.texture_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gx_texture_staging"),
             size: new_cap,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         self.texture_staging_capacity = new_cap;
@@ -1278,6 +1239,8 @@ impl GxRenderer {
     }
 
     pub fn save_pipeline_cache(&self) -> std::io::Result<usize> {
+        let uber_keys: Vec<UberPipelineKey> = self.uber_pipeline_cache.keys().copied().collect();
+        pipeline::save_uber_pipeline_keys(&pipeline::uber_pipeline_cache_path(), &uber_keys)?;
         let path = pipeline::pipeline_cache_path();
         let keys: Vec<pipeline::FullPipelineKey> = self.pipeline_cache.keys().copied().collect();
         pipeline::save_pipeline_keys(&path, &keys)?;
@@ -1312,6 +1275,12 @@ impl GxRenderer {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn request_specialized_pipeline(&mut self, _key: FullPipelineKey) {}
 
+    pub(crate) fn resolve_pipeline(&self, key: &FullPipelineKey) -> &wgpu::RenderPipeline {
+        self.pipeline_cache
+            .get(key)
+            .unwrap_or_else(|| &self.uber_pipeline_cache[&UberPipelineKey::from(*key)])
+    }
+
     pub(crate) fn invalidate_pipeline_caches(&mut self) {
         self.pipeline_cache.clear();
         self.uber_pipeline_cache.clear();
@@ -1324,51 +1293,83 @@ impl GxRenderer {
 
     pub fn prewarm_pipeline_cache(&mut self, device: &wgpu::Device) {
         let path = pipeline::pipeline_cache_path();
-        let keys: Vec<pipeline::FullPipelineKey> = pipeline::load_cached_pipeline_keys(&path)
-            .into_iter()
-            .filter(|k| !self.pipeline_cache.contains_key(k) && self.shader_cache.contains_key(&k.shader))
-            .collect();
+        let keys = pipeline::load_cached_pipeline_keys(&path);
 
-        if keys.is_empty() {
+        let uber_keys: FxHashSet<UberPipelineKey> =
+            pipeline::load_cached_uber_pipeline_keys(&pipeline::uber_pipeline_cache_path())
+                .into_iter()
+                .chain(keys.iter().copied().map(UberPipelineKey::from))
+                .collect();
+        let missing_shaders: FxHashSet<ShaderKey> = uber_keys
+            .iter()
+            .map(|k| k.shader)
+            .filter(|k| !self.shader_cache.contains_key(k))
+            .collect();
+        self.shader_cache.extend(prewarm_shader_variants(
+            device,
+            &missing_shaders.into_iter().collect::<Vec<_>>(),
+        ));
+
+        #[derive(Clone, Copy)]
+        enum WarmupKey {
+            Specialized(FullPipelineKey),
+            Uber(UberPipelineKey),
+        }
+
+        let mut jobs: Vec<WarmupKey> = uber_keys
+            .into_iter()
+            .filter(|k| !self.uber_pipeline_cache.contains_key(k))
+            .map(WarmupKey::Uber)
+            .collect();
+        let num_uber_pipelines = jobs.len();
+        jobs.extend(
+            keys.into_iter()
+                .filter(|k| !self.pipeline_cache.contains_key(k))
+                .map(WarmupKey::Specialized),
+        );
+
+        if jobs.is_empty() {
             return;
         }
 
         let t0 = std::time::Instant::now();
+        let compile = |&key: &WarmupKey| {
+            let pipeline = match key {
+                WarmupKey::Specialized(k) => pipeline::create_specialized_pipeline(
+                    device,
+                    &self.pipeline_layout,
+                    self.surface_format,
+                    &self.shader_cache[&k.shader],
+                    &k,
+                ),
+                WarmupKey::Uber(k) => pipeline::create_uber_pipeline(
+                    device,
+                    &self.pipeline_layout,
+                    self.surface_format,
+                    &self.shader_cache[&k.shader],
+                    &k,
+                ),
+            };
+            (key, pipeline)
+        };
 
         // wgpu 29's WebGPU backend wraps JS handles in Rc<Cell<_>>, making
         // Device/Queue !Send — so the threaded compile path can't even
         // type-check on wasm32. Fall back to a sequential pass there.
         #[cfg(not(target_arch = "wasm32"))]
-        let compiled: Vec<(pipeline::FullPipelineKey, wgpu::RenderPipeline)> = {
+        let compiled: Vec<_> = {
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .min(keys.len());
-            let chunk_size = keys.len().div_ceil(num_threads);
+                .min(jobs.len());
+            let chunk_size = jobs.len().div_ceil(num_threads);
 
-            let self_ref = &*self;
             std::thread::scope(|s| {
-                let handles: Vec<_> = keys
+                let handles: Vec<_> = jobs
                     .chunks(chunk_size)
                     .map(|chunk| {
-                        s.spawn(move || {
-                            chunk
-                                .iter()
-                                .map(|&k| {
-                                    let module = &self_ref.shader_cache[&k.shader];
-                                    (
-                                        k,
-                                        pipeline::create_specialized_pipeline(
-                                            device,
-                                            &self_ref.pipeline_layout,
-                                            self_ref.surface_format,
-                                            module,
-                                            &k,
-                                        ),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        })
+                        let compile = &compile;
+                        s.spawn(move || chunk.iter().map(compile).collect::<Vec<_>>())
                     })
                     .collect();
                 handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
@@ -1376,29 +1377,22 @@ impl GxRenderer {
         };
 
         #[cfg(target_arch = "wasm32")]
-        let compiled: Vec<(pipeline::FullPipelineKey, wgpu::RenderPipeline)> = keys
-            .iter()
-            .map(|&k| {
-                let module = &self.shader_cache[&k.shader];
-                (
-                    k,
-                    pipeline::create_specialized_pipeline(
-                        device,
-                        &self.pipeline_layout,
-                        self.surface_format,
-                        module,
-                        &k,
-                    ),
-                )
-            })
-            .collect();
+        let compiled: Vec<_> = jobs.iter().map(compile).collect();
 
         for (k, p) in compiled {
-            self.pipeline_cache.insert(k, p);
+            match k {
+                WarmupKey::Specialized(k) => {
+                    self.pipeline_cache.insert(k, p);
+                }
+                WarmupKey::Uber(k) => {
+                    self.uber_pipeline_cache.insert(k, p);
+                }
+            }
         }
 
         tracing::info!(
-            num_pipelines = keys.len(),
+            num_pipelines = jobs.len() - num_uber_pipelines,
+            num_uber_pipelines,
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "prewarmed pipeline cache",
         );

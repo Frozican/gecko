@@ -9,6 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 image = { path = "../image" }
+nod = { version = "1.4.4", default-features = false, features = ["compress-zstd"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+indexed_deflate = "0.1.0"
+zerocopy = "0.8.57"
 gecko = { path = "../gecko", features = ["fps-counter"] }
 hostinput = { path = "../hostinput" }
 backend-wgpu = { path = "../backend-wgpu" }
@@ -33,3 +37,12 @@ clap = { version = "4.6.1", features = ["derive"] }
 anyhow = "1.0.102"
 webbrowser = "1.0.5"
 reqwest = { version = "0.13.4", features = ["json"] }
+tempfile = "3.27.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = { version = "0.31.14", features = ["system", "dlopen"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "unstable"] }
+x11-dl = "2.21.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }

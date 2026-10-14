@@ -30,17 +30,25 @@ fn make_sink(
     })
 }
 
-fn finalize_wii(mut emu: Wii, dsp_rom: &[u8], coef_rom: &[u8], sink: Box<McpSink>) -> Wii {
-    emu.dsp.load_irom(dsp_rom);
-    emu.dsp.load_coef(coef_rom);
+fn finalize_wii(mut emu: Wii, dsp_rom: Option<&[u8]>, coef_rom: Option<&[u8]>, sink: Box<McpSink>) -> Wii {
+    if let Some(rom) = dsp_rom {
+        emu.dsp.load_irom(rom);
+    }
+    if let Some(rom) = coef_rom {
+        emu.dsp.load_coef(rom);
+    }
     emu.render_sink = sink;
     emu.apply_host_input(&HostInput::wii_neutral());
     emu
 }
 
-fn finalize_gc(mut emu: GameCube, dsp_rom: &[u8], coef_rom: &[u8], sink: Box<McpSink>) -> GameCube {
-    emu.dsp.load_irom(dsp_rom);
-    emu.dsp.load_coef(coef_rom);
+fn finalize_gc(mut emu: GameCube, dsp_rom: Option<&[u8]>, coef_rom: Option<&[u8]>, sink: Box<McpSink>) -> GameCube {
+    if let Some(rom) = dsp_rom {
+        emu.dsp.load_irom(rom);
+    }
+    if let Some(rom) = coef_rom {
+        emu.dsp.load_coef(rom);
+    }
     emu.render_sink = sink;
     emu.apply_host_input(&HostInput::gc_connected());
     emu
@@ -48,9 +56,9 @@ fn finalize_gc(mut emu: GameCube, dsp_rom: &[u8], coef_rom: &[u8], sink: Box<Mcp
 
 pub fn boot(
     disc_bytes: Vec<u8>,
-    ipl: &[u8],
-    dsp_rom: &[u8],
-    coef_rom: &[u8],
+    ipl: Option<&[u8]>,
+    dsp_rom: Option<&[u8]>,
+    coef_rom: Option<&[u8]>,
     gx: Arc<Mutex<GxRenderer>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -70,9 +78,15 @@ pub fn boot(
     let backend = if dvd.header().is_wii() {
         Backend::Wii(finalize_wii(Wii::apploader_hle(dvd).build(), dsp_rom, coef_rom, sink))
     } else {
-        let mut emu = finalize_gc(GameCube::with_ipl(ipl, true), dsp_rom, coef_rom, sink);
-        emu.insert_dvd(dvd);
-        Backend::Gc(emu)
+        let emu = match ipl {
+            Some(ipl) => {
+                let mut emu = GameCube::with_ipl(ipl, true);
+                emu.insert_dvd(dvd);
+                emu
+            }
+            None => GameCube::with_ipl_hle(dvd),
+        };
+        Backend::Gc(finalize_gc(emu, dsp_rom, coef_rom, sink))
     };
 
     BootResult {
@@ -85,8 +99,8 @@ pub fn boot(
 pub fn boot_dol(
     dol_bytes: Vec<u8>,
     wii: bool,
-    dsp_rom: &[u8],
-    coef_rom: &[u8],
+    dsp_rom: Option<&[u8]>,
+    coef_rom: Option<&[u8]>,
     gx: Arc<Mutex<GxRenderer>>,
     device: wgpu::Device,
     queue: wgpu::Queue,

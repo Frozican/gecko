@@ -8,12 +8,31 @@ use crate::system::SystemId;
 impl GraphicsProcessor {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn drain_fifo<const SYSTEM: SystemId>(&mut self, mmio: &mut Mmio<SYSTEM>, renderer: &mut dyn RenderSink) {
+        self.drain_fifo_inner(mmio, renderer, false);
+    }
+
+    /// Like `drain_fifo`, but yields after a PE token interrupt command to let
+    /// the CPU run. The rest stays buffered until the next scheduled pump.
+    pub fn drain_fifo_until_token<const SYSTEM: SystemId>(
+        &mut self,
+        mmio: &mut Mmio<SYSTEM>,
+        renderer: &mut dyn RenderSink,
+    ) {
+        self.drain_fifo_inner(mmio, renderer, true);
+    }
+
+    fn drain_fifo_inner<const SYSTEM: SystemId>(
+        &mut self,
+        mmio: &mut Mmio<SYSTEM>,
+        renderer: &mut dyn RenderSink,
+        stop_on_token: bool,
+    ) {
         let mut fifo = std::mem::take(&mut self.fifo);
 
         #[cfg(feature = "jit")]
         fifo.reserve(crate::flipper::gx::jit::VEC_OVERREAD_BYTES);
 
-        let pos = self::drain_buf::<SYSTEM>(self, mmio, renderer, &fifo);
+        let pos = self::drain_buf::<SYSTEM>(self, mmio, renderer, &fifo, stop_on_token);
         if pos > 0 {
             fifo.drain(..pos);
         }
@@ -28,6 +47,7 @@ fn drain_buf<const SYSTEM: SystemId>(
     mmio: &mut Mmio<SYSTEM>,
     renderer: &mut dyn RenderSink,
     fifo: &[u8],
+    stop_on_token: bool,
 ) -> usize {
     let mut pos = 0usize;
     loop {
@@ -85,6 +105,13 @@ fn drain_buf<const SYSTEM: SystemId>(
 
                 let mut view = mmio.ram_view_mut();
                 gp.load_bp(renderer, &mut view, &data);
+
+                if stop_on_token && gp.raise_token_interrupt {
+                    if let Some(rec) = gp.recorder.as_deref_mut() {
+                        rec.record_command(&fifo[cmd_start..pos]);
+                    }
+                    break;
+                }
             }
             LOAD_INDX_A_CMD | LOAD_INDX_B_CMD | LOAD_INDX_C_CMD | LOAD_INDX_D_CMD => {
                 if remaining < 5 {
@@ -142,7 +169,7 @@ fn drain_buf<const SYSTEM: SystemId>(
                     }
                 };
 
-                let _ = self::drain_buf::<SYSTEM>(gp, mmio, renderer, &dl_buf);
+                let _ = self::drain_buf::<SYSTEM>(gp, mmio, renderer, &dl_buf, false);
                 gp.dl_scratch = dl_buf;
             }
             DRAW_COMMANDS_START..=DRAW_COMMANDS_END => {

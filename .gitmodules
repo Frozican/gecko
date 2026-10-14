@@ -7,3 +7,7 @@
 [submodule "submodules/beanwii"]
 	path = submodules/beanwii
 	url = https://github.com/zaydlang/beanwii
+[submodule "submodules/dolphin"]
+	path = submodules/dolphin
+	url = https://github.com/dolphin-emu/dolphin
+	shallow = true

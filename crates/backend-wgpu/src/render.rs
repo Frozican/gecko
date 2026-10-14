@@ -10,6 +10,8 @@ pub(crate) struct XfbCopyUniforms {
     dst_size: [f32; 2],
     gamma: f32,
     filter_mode: u32,
+    force_opaque: u32,
+    _pad: [u32; 3],
 }
 
 pub(crate) struct EfbPackPipelines {
@@ -64,7 +66,7 @@ pub(crate) struct EfbDepthPackPipelines {
 
 #[derive(Clone, Copy)]
 enum EfbCopySource {
-    Color { intensity: bool },
+    Color { intensity: bool, alpha_supported: bool },
     Depth,
 }
 
@@ -127,45 +129,28 @@ impl GxRenderer {
         }
 
         let layout = self.draw_buffer_layout;
-        let total_used = layout.index_offset + index_used;
-        let Some(size) = std::num::NonZeroU64::new(total_used) else {
-            return;
-        };
-        let mut view = queue
-            .write_buffer_with(&self.draw_buffer, 0, size)
-            .expect("gx_draw_buffer too small for write_buffer_with");
-        let frame_off = layout.frame_offset as usize;
-        let draw_off = layout.draw_offset as usize;
-        let vertex_off = layout.vertex_offset as usize;
-        let index_off = layout.index_offset as usize;
-        view.slice(frame_off..frame_off + frame_uniform_bytes.len())
-            .copy_from_slice(frame_uniform_bytes);
-        view.slice(draw_off..draw_off + self.scratch_uniform_bytes.len())
-            .copy_from_slice(&self.scratch_uniform_bytes);
+        queue.write_buffer(&self.draw_buffer, layout.frame_offset, frame_uniform_bytes);
+        queue.write_buffer(&self.draw_buffer, layout.draw_offset, &self.scratch_uniform_bytes);
 
+        self.scratch_vertex_bytes.resize(vertex_used as usize, 0);
         for draw in &self.scratch_draws {
             let stride = draw.packed_vertex_stride as usize;
-            let texcoord_bytes = stride - 68;
-            let mut cursor = vertex_off + draw.packed_vertex_byte_offset as usize;
+            let mut cursor = draw.packed_vertex_byte_offset as usize;
             let src_base = draw.src_vertex_index as usize;
             let src_end = src_base + draw.vertex_count as usize;
             for src_v in &self.scratch_vertices[src_base..src_end] {
-                let src_bytes = bytemuck::bytes_of(src_v);
-
-                view.slice(cursor..cursor + 68).copy_from_slice(&src_bytes[..68]);
-                if texcoord_bytes > 0 {
-                    view.slice(cursor + 68..cursor + 68 + texcoord_bytes)
-                        .copy_from_slice(&src_bytes[68..68 + texcoord_bytes]);
-                }
-
+                self.scratch_vertex_bytes[cursor..cursor + stride]
+                    .copy_from_slice(&bytemuck::bytes_of(src_v)[..stride]);
                 cursor += stride;
             }
         }
+        queue.write_buffer(&self.draw_buffer, layout.vertex_offset, &self.scratch_vertex_bytes);
 
-        if !self.scratch_indices.is_empty() {
-            view.slice(index_off..index_off + index_used as usize)
-                .copy_from_slice(bytemuck::cast_slice(&self.scratch_indices));
-        }
+        queue.write_buffer(
+            &self.draw_buffer,
+            layout.index_offset,
+            bytemuck::cast_slice(&self.scratch_indices),
+        );
     }
 
     pub(crate) fn execute_copy_xfb(
@@ -277,6 +262,8 @@ impl GxRenderer {
                 dst_size: [scaled_w as f32, scaled_dst_h as f32],
                 gamma,
                 filter_mode: 0,
+                force_opaque: 0,
+                _pad: [0; 3],
             };
             queue.write_buffer(&self.xfb_copy_uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
@@ -374,8 +361,9 @@ impl GxRenderer {
         half: bool,
         copy_format: CopyFormat,
         source: EfbCopySource,
+        palette_source: Option<wgpu::Texture>,
     ) {
-        if let EfbCopySource::Color { intensity } = source {
+        if let EfbCopySource::Color { intensity, .. } = source {
             debug_assert!(
                 self.efb_pack_pipelines.for_color(copy_format, intensity).is_some(),
                 "cache_efb_copy called with depth-only copy format {copy_format:?}",
@@ -405,6 +393,14 @@ impl GxRenderer {
                 EfbCopySource::Color { .. } => u32::from(half),
                 EfbCopySource::Depth => 0,
             },
+            force_opaque: u32::from(matches!(
+                source,
+                EfbCopySource::Color {
+                    alpha_supported: false,
+                    ..
+                }
+            )),
+            _pad: [0; 3],
         };
         let uniform_buffer = match source {
             EfbCopySource::Color { .. } => &self.xfb_copy_uniform_buffer,
@@ -439,7 +435,7 @@ impl GxRenderer {
                 multiview_mask: None,
             });
             let (pipeline, bind_group) = match source {
-                EfbCopySource::Color { intensity } => (
+                EfbCopySource::Color { intensity, .. } => (
                     self.efb_pack_pipelines.for_color(copy_format, intensity).unwrap(),
                     &self.xfb_copy_bind_group,
                 ),
@@ -468,6 +464,7 @@ impl GxRenderer {
                 native_h: dst_h,
                 texture: tex,
                 view,
+                palette_source,
             },
         );
     }
@@ -525,16 +522,20 @@ impl GxRenderer {
     pub(crate) fn return_load_texture_to_pool(&mut self, tex: wgpu::Texture) {
         const PER_BUCKET_CAP: usize = 8;
 
+        // Pack textures are immutable and may be shared by several guest keys.
+        if !tex.usage().contains(crate::LOAD_TEXTURE_USAGE) {
+            return;
+        }
+
         debug_assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
-        debug_assert_eq!(tex.mip_level_count(), 1);
         debug_assert_eq!(tex.sample_count(), 1);
         debug_assert_eq!(tex.dimension(), wgpu::TextureDimension::D2);
-        debug_assert!(tex.usage().contains(
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-        ));
 
         let size = tex.size();
-        let bucket = self.texture_pool.entry((size.width, size.height)).or_default();
+        let bucket = self
+            .texture_pool
+            .entry((size.width, size.height, tex.mip_level_count()))
+            .or_default();
         if bucket.len() < PER_BUCKET_CAP {
             bucket.push(tex);
         }
@@ -644,9 +645,6 @@ impl GxRenderer {
         encoder.pop_debug_group();
         self.current_encoder = Some(encoder);
         let _ = self.submit_pending(queue);
-        // The staging buffer's in-flight references have just been submitted;
-        // now's the safe moment to grow it if this frame exceeded capacity.
-        self.maybe_grow_texture_staging(device);
         self.xfb_has_content = true;
     }
 
@@ -710,6 +708,7 @@ impl GxRenderer {
         stride: u32,
         depth_copy: bool,
         is_intensity: bool,
+        alpha_supported: bool,
     ) {
         tracing::debug!(
             dest_addr = format!("{dest_addr:#010X}"),
@@ -749,6 +748,9 @@ impl GxRenderer {
             return;
         };
 
+        let readback_width = if mipmap { (width / 2).max(1) } else { width };
+        let readback_height = if mipmap { (height / 2).max(1) } else { height };
+
         if depth_copy {
             self.execute_depth_writeback(
                 device,
@@ -762,6 +764,20 @@ impl GxRenderer {
                 stride,
                 copy_format_enum,
             );
+
+            let mut encoder = self.take_or_create_encoder(device);
+            let palette_source = self.snapshot_palette_source(
+                device,
+                &mut encoder,
+                dest_addr,
+                copy_format_enum,
+                self.efb_depth_writeback_target.as_ref().unwrap().0.as_image_copy(),
+                readback_width,
+                readback_height,
+                wgpu::TextureFormat::Rgba8Unorm,
+            );
+            self.current_encoder = Some(encoder);
+
             self.cache_efb_copy(
                 device,
                 queue,
@@ -773,12 +789,11 @@ impl GxRenderer {
                 mipmap,
                 copy_format_enum,
                 EfbCopySource::Depth,
+                palette_source,
             );
             return;
         }
 
-        let readback_width = if mipmap { (width / 2).max(1) } else { width };
-        let readback_height = if mipmap { (height / 2).max(1) } else { height };
         self.discard_superseded_writebacks(dest_addr, readback_width, readback_height, copy_format_enum, stride);
 
         let bytes_per_row = align_up(readback_width as u64 * 4, 256);
@@ -808,6 +823,8 @@ impl GxRenderer {
                 dst_size: [readback_width as f32, readback_height as f32],
                 gamma: 1.0,
                 filter_mode: if mipmap { 2 } else { 0 },
+                force_opaque: 0,
+                _pad: [0; 3],
             };
             queue.write_buffer(
                 &self.efb_color_readback_uniform_buffer,
@@ -858,13 +875,25 @@ impl GxRenderer {
             (readback_tex, wgpu::Origin3d::ZERO)
         };
 
+        let src = wgpu::TexelCopyTextureInfo {
+            texture: src_texture,
+            mip_level: 0,
+            origin: src_origin,
+            aspect: wgpu::TextureAspect::All,
+        };
+        let palette_source = self.snapshot_palette_source(
+            device,
+            &mut encoder,
+            dest_addr,
+            copy_format_enum,
+            src,
+            readback_width,
+            readback_height,
+            self.surface_format.remove_srgb_suffix(),
+        );
+
         encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: src_texture,
-                mip_level: 0,
-                origin: src_origin,
-                aspect: wgpu::TextureAspect::default(),
-            },
+            src,
             wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -901,6 +930,7 @@ impl GxRenderer {
             copy_format: copy_format_enum,
             stride,
             swap_bgra,
+            force_opaque: !alpha_supported,
         });
 
         self.cache_efb_copy(
@@ -915,7 +945,9 @@ impl GxRenderer {
             copy_format_enum,
             EfbCopySource::Color {
                 intensity: is_intensity,
+                alpha_supported,
             },
+            palette_source,
         );
     }
 
@@ -952,7 +984,49 @@ impl GxRenderer {
             copy_format: copy_format_enum,
             stride,
             swap_bgra: false,
+            force_opaque: false,
         });
+    }
+
+    fn snapshot_palette_source(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        dest_addr: Address,
+        copy_format: CopyFormat,
+        src: wgpu::TexelCopyTextureInfo<'_>,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Option<wgpu::Texture> {
+        if !copy_format.is_palette_index() {
+            return None;
+        }
+
+        let texture = self
+            .efb_copy_cache
+            .get(&dest_addr)
+            .and_then(|entry| entry.palette_source.as_ref())
+            .filter(|texture| texture.width() == width && texture.height() == height && texture.format() == format)
+            .cloned()
+            .unwrap_or_else(|| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("efb_native_palette_source"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            });
+        encoder.copy_texture_to_texture(src, texture.as_image_copy(), texture.size());
+        Some(texture)
     }
 
     fn encode_depth_readback(
@@ -980,6 +1054,8 @@ impl GxRenderer {
             dst_size: [encode_w as f32, encode_h as f32],
             gamma: 1.0,
             filter_mode: 0,
+            force_opaque: 0,
+            _pad: [0; 3],
         };
         queue.write_buffer(&self.efb_depth_resolve_uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         self.efb_depth_resolve_uniform_write_pending = true;
@@ -1048,33 +1124,56 @@ impl GxRenderer {
             return 0x00FF_FFFF;
         }
 
+        self.read_efb_depth(device, queue, [x, y, 1, 1])
+            .and_then(|v| v.first().copied())
+            .unwrap_or(0x00FF_FFFF)
+    }
+
+    pub(crate) fn capture_efb_depth(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Vec<u32>> {
+        self.read_efb_depth(device, queue, [0, 0, crate::EFB_WIDTH, crate::EFB_HEIGHT])
+    }
+
+    fn read_efb_depth(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rect: [u32; 4]) -> Option<Vec<u32>> {
+        let [_, _, width, height] = rect;
+
         self.flush_pending_draws(device, queue);
 
-        let (staging, capacity, bytes_per_row) = self.encode_depth_readback(device, queue, [x, y, 1, 1], [1, 1]);
+        let (staging, capacity, stride) = self.encode_depth_readback(device, queue, rect, [width, height]);
         let submission_index = self.submit_pending(queue);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        staging
-            .slice(..bytes_per_row)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = done_tx.send(result);
-            });
-        let poll_result = device.poll(wgpu::PollType::Wait {
+        let size = stride * height as u64;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..size).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        let poll = device.poll(wgpu::PollType::Wait {
             submission_index,
             timeout: Some(std::time::Duration::from_secs(5)),
         });
-        let map_result = done_rx.try_recv();
-        let depth = if poll_result.is_ok() && matches!(map_result, Ok(Ok(()))) {
-            let mapped = staging.slice(..bytes_per_row).get_mapped_range();
 
-            ((mapped[0] as u32) << 16) | ((mapped[1] as u32) << 8) | mapped[2] as u32
+        let result = if poll.is_ok() && matches!(rx.try_recv(), Ok(Ok(()))) {
+            let mapped = staging.slice(..size).get_mapped_range();
+
+            Some(
+                mapped
+                    .chunks_exact(stride as usize)
+                    .flat_map(|row| {
+                        row[..width as usize * 4]
+                            .chunks_exact(4)
+                            .map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32)
+                    })
+                    .collect(),
+            )
         } else {
-            tracing::warn!(?poll_result, ?map_result, "EFB depth peek failed");
-            0x00FF_FFFF
+            tracing::warn!(?poll, "EFB depth snapshot failed");
+            None
         };
+
         staging.unmap();
         self.return_readback_staging(staging, capacity);
 
-        depth
+        result
     }
 
     pub(crate) fn ensure_writeback_target(
@@ -1148,7 +1247,7 @@ impl GxRenderer {
                 && pending.copy_format == copy_format
                 && pending.stride == stride
             {
-                let old = self.pending_writebacks.swap_remove(i);
+                let old = self.pending_writebacks.remove(i);
                 self.return_readback_staging(old.staging, old.staging_capacity);
             } else {
                 i += 1;
@@ -1222,6 +1321,12 @@ impl GxRenderer {
                 }
             }
             w.staging.unmap();
+
+            if w.force_opaque {
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
+            }
 
             let encoded = texture::encode_from_rgba(&rgba, w.width as usize, w.height as usize, w.copy_format);
             let row_bytes = texture::encoded_row_bytes(w.width, w.copy_format);

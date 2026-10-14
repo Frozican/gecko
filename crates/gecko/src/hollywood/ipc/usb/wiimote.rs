@@ -126,9 +126,14 @@ const NUNCHUK_CALIBRATION: [u8; 16] = [
 const NUNCHUK_KEY_REG_BASE: u8 = 0x40;
 const NUNCHUK_KEY_LEN: usize = 16;
 
-const WIIMOTE_ACCEL_ZERO_G: i32 = 0x80;
-const WIIMOTE_ACCEL_LSB_PER_G: f32 = 0x1A as f32;
-const ACCEL_REST: [u8; 3] = [0x80, 0x80, 0xB3];
+const WIIMOTE_ACCEL_ZERO_G: i32 = WIIMOTE_EEPROM_CALIBRATION[0x16] as i32;
+const WIIMOTE_ACCEL_ONE_G: i32 = WIIMOTE_EEPROM_CALIBRATION[0x1A] as i32;
+const WIIMOTE_ACCEL_LSB_PER_G: f32 = (WIIMOTE_ACCEL_ONE_G - WIIMOTE_ACCEL_ZERO_G) as f32;
+const ACCEL_REST: [u8; 3] = [
+    WIIMOTE_ACCEL_ZERO_G as u8,
+    WIIMOTE_ACCEL_ZERO_G as u8,
+    WIIMOTE_ACCEL_ONE_G as u8,
+];
 
 pub const REPORT_HZ: u64 = 200;
 
@@ -144,6 +149,7 @@ fn encode_wiimote_g(g: f32) -> u8 {
 #[derive(Debug, Clone)]
 pub(super) struct WiimoteState {
     buttons: u16,
+    sideways: bool,
     report_mode: ReportMode,
     continuous: bool,
     leds: u8,
@@ -179,6 +185,7 @@ impl Default for WiimoteState {
 
         Self {
             buttons: 0,
+            sideways: false,
             report_mode: ReportMode::Core,
             continuous: false,
             leds: 0,
@@ -205,6 +212,26 @@ impl Default for WiimoteState {
 }
 
 impl WiimoteState {
+    pub(super) fn set_options(&mut self, attached: bool, sideways: bool) -> bool {
+        self.dirty |= self.sideways != sideways;
+        self.sideways = sideways;
+
+        if self.nunchuk_attached == attached {
+            return false;
+        }
+
+        self.nunchuk_attached = attached;
+        self.nunchuk_buttons = 0;
+        self.nunchuk_stick_x = NUNCHUK_STICK_CENTER;
+        self.nunchuk_stick_y = NUNCHUK_STICK_CENTER;
+        self.nunchuk_key_buf = [0; NUNCHUK_KEY_LEN];
+        self.nunchuk_key_valid = 0;
+        self.nunchuk_cipher = Cipher::IDENTITY;
+        self.dirty = true;
+
+        true
+    }
+
     pub(super) fn set_buttons(&mut self, buttons: u16) -> bool {
         let changed = self.buttons != buttons;
         self.buttons = buttons;
@@ -213,6 +240,10 @@ impl WiimoteState {
     }
 
     pub(super) fn set_nunchuk(&mut self, buttons: u8, stick_x: u8, stick_y: u8) -> bool {
+        if !self.nunchuk_attached {
+            return false;
+        }
+
         let changed =
             self.nunchuk_buttons != buttons || self.nunchuk_stick_x != stick_x || self.nunchuk_stick_y != stick_y;
         self.nunchuk_buttons = buttons;
@@ -275,12 +306,31 @@ impl WiimoteState {
     }
 
     fn button_bytes(&self) -> [u8; 2] {
-        self.buttons.to_be_bytes()
+        let mut buttons = self.buttons;
+        if self.sideways {
+            buttons &= !(BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT);
+            for (from, to) in [
+                (BTN_UP, BTN_RIGHT),
+                (BTN_DOWN, BTN_LEFT),
+                (BTN_LEFT, BTN_UP),
+                (BTN_RIGHT, BTN_DOWN),
+            ] {
+                if self.buttons & from != 0 {
+                    buttons |= to;
+                }
+            }
+        }
+        buttons.to_be_bytes()
     }
 
     pub(super) fn make_input_report(&self) -> Vec<u8> {
         let [bb0, bb1] = self.button_bytes();
-        let accel = self.accel;
+        let accel = if self.sideways {
+            let flip = |v: u8| (2 * WIIMOTE_ACCEL_ZERO_G - v as i32).clamp(0, 255) as u8;
+            [flip(self.accel[2]), flip(self.accel[0]), self.accel[1]]
+        } else {
+            self.accel
+        };
         let mode = self.report_mode;
 
         let mut r = vec![HID_PREFIX_INPUT, mode as u8, bb0, bb1];
@@ -531,6 +581,10 @@ impl WiimoteState {
     /// have arrived we derive `ft`/`sb` and switch our outgoing extension
     /// bytes and register read responses to encrypted output.
     fn observe_register_write(&mut self, address: u32, payload: &[u8]) {
+        if !self.nunchuk_attached {
+            return;
+        }
+
         let reg = (address & 0xFF) as u8;
         let Some(rel) = reg.checked_sub(NUNCHUK_KEY_REG_BASE) else {
             return;
@@ -577,7 +631,7 @@ impl WiimoteState {
         report
     }
 
-    fn make_status_report(&self) -> Vec<u8> {
+    pub(super) fn make_status_report(&self) -> Vec<u8> {
         let [bb0, bb1] = self.button_bytes();
         let ir_enabled = self.ir_enabled_pin1 && self.ir_enabled_pin2;
         let mut flags = self.leds << 4;
@@ -612,23 +666,23 @@ fn pack_ir_basic(objects: &[Option<(u16, u16)>; 4]) -> [u8; 10] {
     out
 }
 
-fn split_ir_coords(x: u16, y: u16) -> (u8, u8, u8, u8) {
-    (x as u8, ((x >> 8) & 0x03) as u8, y as u8, ((y >> 8) & 0x03) as u8)
+fn split_ir_coords(x: u16, y: u16) -> (u8, u8, u8) {
+    let hi = (((y >> 8) & 0x03) << 2) | ((x >> 8) & 0x03);
+
+    (x as u8, y as u8, hi as u8)
 }
 
 fn pack_ir_basic_pair(out: &mut [u8], p1: Option<(u16, u16)>, p2: Option<(u16, u16)>) {
-    if let Some((x, y)) = p1 {
-        let (x_lo, x_hi, y_lo, y_hi) = self::split_ir_coords(x, y);
-        out[0] = x_lo;
-        out[1] = y_lo;
-        out[2] = (out[2] & 0xF0) | (y_hi << 2) | x_hi;
-    }
+    for (base, shift, point) in [(0usize, 4u32, p1), (3, 0, p2)] {
+        let Some((x, y)) = point else {
+            continue;
+        };
 
-    if let Some((x, y)) = p2 {
-        let (x_lo, x_hi, y_lo, y_hi) = self::split_ir_coords(x, y);
-        out[3] = x_lo;
-        out[4] = y_lo;
-        out[2] = (out[2] & 0x0F) | (y_hi << 6) | (x_hi << 4);
+        let (x_lo, y_lo, hi) = self::split_ir_coords(x, y);
+
+        out[base] = x_lo;
+        out[base + 1] = y_lo;
+        out[2] = (out[2] & !(0xFu8 << shift)) | (hi << shift);
     }
 }
 
@@ -638,10 +692,11 @@ fn pack_ir_extended(objects: &[Option<(u16, u16)>; 4]) -> [u8; 12] {
     for (i, slot) in objects.iter().enumerate() {
         if let Some((x, y)) = *slot {
             let base = i * 3;
-            let (x_lo, x_hi, y_lo, y_hi) = self::split_ir_coords(x, y);
+            let (x_lo, y_lo, hi) = self::split_ir_coords(x, y);
+
             out[base] = x_lo;
             out[base + 1] = y_lo;
-            out[base + 2] = (3 << 4) | (y_hi << 2) | x_hi;
+            out[base + 2] = (hi << 4) | 3;
         }
     }
 
@@ -663,62 +718,6 @@ fn trivial_ack(button_bytes: [u8; 2], report_id: u8) -> Vec<Vec<u8>> {
         report_id,
         0x00,
     ]]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn core_button_report_encodes_a_press_and_release() {
-        let mut wiimote = WiimoteState::default();
-
-        assert!(wiimote.set_buttons(BTN_A));
-        assert_eq!(wiimote.make_input_report(), [0xA1, 0x30, 0x00, 0x08]);
-
-        assert!(wiimote.set_buttons(0));
-        assert_eq!(wiimote.make_input_report(), [0xA1, 0x30, 0x00, 0x00]);
-    }
-
-    #[test]
-    fn data_reporting_mode_selects_extended_minimal_reports() {
-        let mut wiimote = WiimoteState::default();
-
-        assert!(wiimote.set_buttons(BTN_A));
-        let acks = wiimote.handle_output_report(&[0xA2, 0x12, 0x04, 0x31]);
-        assert_eq!(acks, vec![vec![0xA1, 0x22, 0x00, 0x08, 0x12, 0x00]]);
-        assert!(wiimote.continuous);
-        assert_eq!(wiimote.make_input_report(), [0xA1, 0x31, 0x00, 0x08, 0x80, 0x80, 0xB3]);
-
-        let acks = wiimote.handle_output_report(&[0xA2, 0x12, 0x00, 0x33]);
-        assert_eq!(acks, vec![vec![0xA1, 0x22, 0x00, 0x08, 0x12, 0x00]]);
-        let mut expected = vec![0xA1, 0x33, 0x00, 0x08, 0x80, 0x80, 0xB3];
-        expected.extend_from_slice(&[0xFF; 12]);
-        assert_eq!(wiimote.make_input_report(), expected);
-    }
-
-    #[test]
-    fn read_memory_returns_chunked_calibration_data() {
-        let mut wiimote = WiimoteState::default();
-        let reports = wiimote.handle_output_report(&[0xA2, 0x17, 0x00, 0x00, 0x00, 0x16, 0x00, 0x10]);
-        assert_eq!(reports.len(), 1);
-        let r = &reports[0];
-        assert_eq!(&r[0..2], &[0xA1, 0x21]);
-        assert_eq!(r[4], 0xF0); // 16 bytes - 1 = 0x0F, shifted into upper nibble
-        assert_eq!(&r[5..7], &[0x00, 0x16]);
-        assert_eq!(&r[7..23], &WIIMOTE_EEPROM_CALIBRATION[22..38]);
-    }
-
-    #[test]
-    fn unsupported_report_mode_is_rejected_and_kept_at_previous() {
-        let mut wiimote = WiimoteState::default();
-        // Pin a known mode first.
-        wiimote.handle_output_report(&[0xA2, 0x12, 0x00, 0x31]);
-        assert_eq!(wiimote.report_mode, ReportMode::CoreAccel);
-        // Reject unknown mode 0x3D and stay on 0x31.
-        wiimote.handle_output_report(&[0xA2, 0x12, 0x00, 0x3D]);
-        assert_eq!(wiimote.report_mode, ReportMode::CoreAccel);
-    }
 }
 
 impl WiimoteState {

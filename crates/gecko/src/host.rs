@@ -11,8 +11,10 @@ use std::path::PathBuf;
 /// frame) silently overwrite each other and bind groups built lazily at
 /// render-pass time all resolve to whichever decode landed last.
 ///
-/// `variant` is `0` for non-paletted formats and a 32-bit hash of
-/// `(palette content, tlut.format, tmem_offset)` for paletted ones.
+/// `variant` combines mip count and mipmap enablement with a 32-bit hash of
+/// `(palette content, tlut.format, tmem_offset)` for paletted textures.
+/// Single-level, non-paletted RAM textures use `0`. Preloaded textures also
+/// mix in their odd-bank TMEM address.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TextureKey {
     pub ram_addr: Address,
@@ -23,6 +25,13 @@ impl TextureKey {
     pub const fn non_paletted(ram_addr: Address) -> Self {
         Self { ram_addr, variant: 0 }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TextureLod {
+    pub min: u8,
+    pub max: u8,
+    pub bias: i8,
 }
 
 #[derive(Debug)]
@@ -49,15 +58,28 @@ pub enum GxAction {
     SetAlphaCompare(AlphaCompare),
     SetCullMode(CullMode),
 
-    /// Upload pre-decoded texture data. Emitted when texture content at a
-    /// given address changes (detected by hash).
+    /// Decode and upload a snapshot of GX texture bytes and palette. Emitted
+    /// when texture content at a given address changes (detected by hash).
     LoadTexture {
         id: TextureKey,
         width: u32,
         height: u32,
         fmt: TextureFormat,
-        rgba: Vec<u8>,
+        mip_levels: u32,
+        /// `None` references an existing GPU EFB copy without uploading RAM.
+        data: Option<crate::flipper::gx::texture::EncodedTexture>,
     },
+
+    LoadEfbPalette {
+        id: TextureKey,
+        width: u32,
+        height: u32,
+        palette: Box<[[u8; 4]; 256]>,
+    },
+
+    /// Drop textures, EFB copies and bind groups derived from emulated memory
+    /// after restoring a state. Immutable GPU pipelines remain valid.
+    InvalidateStateCaches,
 
     /// Debug action: Drop every cached pipeline, bind group, and texture on
     /// the renderer side. Used by the GX debug window to force fresh decodes.
@@ -79,6 +101,7 @@ pub enum GxAction {
         wrap_t: WrapMode,
         mag_filter: MagFilter,
         min_filter: MinFilter,
+        lod: TextureLod,
     },
 
     /// Issue a draw call. The renderer uses its tracked state (projection,
@@ -115,7 +138,7 @@ pub enum GxAction {
     },
 
     /// Present a CPU-drawn external framebuffer read straight from guest RAM
-    /// (no GX EFB copy happened, e.g. consoletest).
+    /// (e.g. consoletest, or a movie decoder overwriting a GX copy).
     PresentRawXfb {
         width: u32,
         height: u32,
@@ -181,7 +204,11 @@ pub struct DrawData {
 
 #[derive(Debug, Clone, Default)]
 pub struct DrawState {
+    pub dst_alpha: Option<u8>,
     pub active_texcoords: u8,
+    pub texgen_types: u32,
+    pub texcoord_scales: [u32; 16],
+    pub zfreeze: Option<crate::flipper::gx::depth::DepthPlane>,
     // TEV combiner state
     pub tev_color_env: [u32; 16],
     pub tev_alpha_env: [u32; 16],
@@ -286,6 +313,10 @@ pub trait RenderSink: Send {
         0x00FF_FFFF
     }
 
+    fn capture_efb_depth(&mut self) -> Option<Vec<u32>> {
+        None
+    }
+
     fn exec_draw(&mut self, segment: DrawSegment, state: Option<DrawState>) {
         let mut draw = self.take_draw_data();
         draw.segments.clear();
@@ -301,6 +332,8 @@ pub trait RenderSink: Send {
     }
 
     fn vertex_scratch(&mut self) -> &mut Vec<DrawVertex>;
+
+    fn inspect_draws(&mut self, _gx: &crate::flipper::gx::GraphicsProcessor, _segments: &[DrawSegment]) {}
 
     fn has_pending_efb_texture(&self, _addr: u32, _width: u32, _height: u32, _fmt: TextureFormat) -> bool {
         false

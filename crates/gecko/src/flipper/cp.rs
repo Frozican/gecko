@@ -126,7 +126,7 @@ impl CommandProcessor {
         self.fifo_read_ptr_hi = regs::FifoReadPtrHi::from_raw((v >> 16) as u16);
     }
 
-    pub fn refresh_status(&mut self) {
+    pub fn refresh_status(&mut self, gx_pending: bool) {
         let dist = self.fifo_rw_distance();
         let hi = self.fifo_hi_watermark();
         let lo = self.fifo_lo_watermark();
@@ -136,7 +136,7 @@ impl CommandProcessor {
             .with_fifo_overflow(hi != 0 && dist > hi)
             .with_fifo_underflow(lo != 0 && dist < lo)
             .with_read_idle(read_idle)
-            .with_cmd_idle(read_idle)
+            .with_cmd_idle(read_idle && !gx_pending)
             .with_bp_interrupt(bp);
     }
 }
@@ -217,28 +217,29 @@ pub fn gather_pipe_bursted<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     let linked = sys.cp.control.gp_link_enable();
 
     while sys.cp.gather_pos >= GP_BURST {
+        let wptr = sys.pi.fifo_wptr;
+        sys.sync_deferred_efb_writeback(wptr, GP_BURST as usize);
+
+        let mut burst = [0u8; GP_BURST as usize];
+        burst.copy_from_slice(&sys.cp.gather_pipe[..GP_BURST as usize]);
+
+        match sys.mmio.ram_view_mut().slice_mut(wptr as usize, GP_BURST as usize) {
+            Some(dst) => dst.copy_from_slice(&burst),
+            None => tracing::warn!(
+                wptr = format!("{wptr:#010X}"),
+                "gather_pipe_bursted: PI fifo_wptr unmapped"
+            ),
+        }
+
+        let advanced = wptr.wrapping_add(GP_BURST);
+        let next_wptr = if sys.pi.fifo_end != 0 && advanced >= sys.pi.fifo_end {
+            sys.pi.fifo_base
+        } else {
+            advanced
+        };
+
+        sys.pi.fifo_wptr = next_wptr;
         if linked {
-            let wptr = sys.pi.fifo_wptr;
-
-            let mut burst = [0u8; GP_BURST as usize];
-            burst.copy_from_slice(&sys.cp.gather_pipe[..GP_BURST as usize]);
-
-            match sys.mmio.ram_view_mut().slice_mut(wptr as usize, GP_BURST as usize) {
-                Some(dst) => dst.copy_from_slice(&burst),
-                None => tracing::warn!(
-                    wptr = format!("{wptr:#010X}"),
-                    "gather_pipe_bursted: PI fifo_wptr unmapped"
-                ),
-            }
-
-            let advanced = wptr.wrapping_add(GP_BURST);
-            let next_wptr = if sys.pi.fifo_end != 0 && advanced >= sys.pi.fifo_end {
-                sys.pi.fifo_base
-            } else {
-                advanced
-            };
-
-            sys.pi.fifo_wptr = next_wptr;
             sys.cp.set_fifo_write_ptr(next_wptr);
             sys.cp
                 .set_fifo_rw_distance(sys.cp.fifo_rw_distance().saturating_add(GP_BURST));
@@ -255,7 +256,7 @@ pub fn gather_pipe_bursted<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     }
 
     if linked {
-        sys.cp.refresh_status();
+        sys.cp.refresh_status(!sys.gx.fifo.is_empty());
         refresh_interrupts(sys);
     }
 }
@@ -271,7 +272,9 @@ pub fn pump_fifo<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
 
     while !sys.cp.interrupt_active() && sys.cp.control.gp_fifo_read_enable() && sys.cp.fifo_rw_distance() >= GP_BURST {
         let read_ptr = sys.cp.fifo_read_ptr();
-        if sys.cp.control.bp_interrupt_enable() && read_ptr == sys.cp.fifo_bp() {
+        // Breakpoint comparison remains enabled when the CPU masks its IRQ.
+        // Reading past it can consume the next frame's PE token too early.
+        if sys.cp.control.bp_enable() && read_ptr == sys.cp.fifo_bp() {
             sys.cp.status = sys.cp.status.with_bp_interrupt(true);
             refresh_interrupts(sys);
             break;
@@ -295,16 +298,18 @@ pub fn pump_fifo<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
         consumed += 1;
     }
 
-    if consumed > 0 {
-        sys.gx.drain_fifo(&mut sys.mmio, sys.render_sink.as_mut());
+    // Yield after a token interrupt so the CPU can observe it before another
+    // token overwrites it.
+    if consumed > 0 || !sys.gx.fifo.is_empty() {
+        sys.gx.drain_fifo_until_token(&mut sys.mmio, sys.render_sink.as_mut());
         sys.gx.defer_pending_efb_writebacks(&mut sys.mmio);
         sys.check_gx_pe_interrupts();
-        sys.cp.refresh_status();
+        sys.cp.refresh_status(!sys.gx.fifo.is_empty());
         refresh_interrupts(sys);
     }
 
     if consumed > 0
-        && sys.cp.control.bp_interrupt_enable()
+        && sys.cp.control.bp_enable()
         && !sys.cp.status.bp_interrupt()
         && sys.cp.fifo_rw_distance() == 0
         && sys.cp.fifo_read_ptr() == sys.cp.fifo_bp()

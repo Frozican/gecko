@@ -120,6 +120,10 @@ pub const fn fastmem_lut_ptr_offset<const SYSTEM: SystemId>() -> usize {
     offset_of!(System<SYSTEM>, mmio) + offset_of!(Mmio<SYSTEM>, fastmem_lut_ptr)
 }
 
+pub const fn lcache_fastmem_ptr_offset<const SYSTEM: SystemId>() -> usize {
+    offset_of!(System<SYSTEM>, mmio) + offset_of!(Mmio<SYSTEM>, lcache_fastmem_ptr)
+}
+
 #[inline(always)]
 pub const fn code_refcount_ptr_offset<const SYSTEM: SystemId>() -> usize {
     offset_of!(System<SYSTEM>, mmio) + offset_of!(Mmio<SYSTEM>, code_refcount_ptr)
@@ -237,7 +241,6 @@ pub fn spr_field_offset<const SYSTEM: SystemId>(spr_num: u16) -> Option<usize> {
         918 => offset_of!(Spr, gqr6),
         919 => offset_of!(Spr, gqr7),
         920 => offset_of!(Spr, hid2),
-        921 => offset_of!(Spr, wpar),
         936 => offset_of!(Spr, ummcr0),
         937 => offset_of!(Spr, upmc1),
         938 => offset_of!(Spr, upmc2),

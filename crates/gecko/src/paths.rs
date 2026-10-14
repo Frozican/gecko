@@ -13,15 +13,20 @@ pub fn base() -> &'static Path {
             return PathBuf::from(custom);
         }
 
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("."))
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     })
 }
 
 pub fn resolve(rel: impl AsRef<Path>) -> PathBuf {
     self::base().join(rel)
+}
+
+pub fn fs_root() -> PathBuf {
+    if let Some(custom) = std::env::var_os("GECKO_FS_ROOT") {
+        return PathBuf::from(custom);
+    }
+
+    self::resolve("fs")
 }
 
 pub fn cache(rel: impl AsRef<Path>) -> PathBuf {

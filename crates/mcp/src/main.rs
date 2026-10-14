@@ -34,22 +34,22 @@ struct Cli {
     )]
     wii: bool,
 
-    #[arg(long, value_name = "PATH", help = "Override the embedded GameCube IPL")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Decoded GameCube IPL to boot discs with instead of IPL HLE"
+    )]
     ipl: Option<PathBuf>,
 
-    #[arg(long, value_name = "PATH", help = "Override the embedded DSP IROM")]
+    #[arg(long, value_name = "PATH", help = "DSP IROM to use instead of Dolphin's DSP ROM")]
     dsp: Option<PathBuf>,
 
-    #[arg(long, value_name = "PATH", help = "Override the embedded DSP COEF ROM")]
+    #[arg(long, value_name = "PATH", help = "DSP COEF ROM to use instead of Dolphin's DSP ROM")]
     coef: Option<PathBuf>,
 
     #[arg(long, help = "Resume the emulator immediately after loading the disc")]
     resume: bool,
 }
-
-const DEFAULT_IPL: &[u8] = include_bytes!("../../../private/IPL.decoded.bin");
-const DEFAULT_DSP_ROM: &[u8] = include_bytes!("../../../private/dsp_rom.bin");
-const DEFAULT_COEF_ROM: &[u8] = include_bytes!("../../../private/dsp_coef.bin");
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -60,20 +60,20 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let ipl = match cli.ipl {
-        Some(p) => std::fs::read(&p).with_context(|| format!("read IPL {p:?}"))?,
-        None => DEFAULT_IPL.to_vec(),
-    };
+    let ipl = cli
+        .ipl
+        .map(|p| std::fs::read(&p).with_context(|| format!("read IPL {p:?}")))
+        .transpose()?;
 
-    let dsp_rom = match cli.dsp {
-        Some(p) => std::fs::read(&p).with_context(|| format!("read DSP IROM {p:?}"))?,
-        None => DEFAULT_DSP_ROM.to_vec(),
-    };
+    let dsp_rom = cli
+        .dsp
+        .map(|p| std::fs::read(&p).with_context(|| format!("read DSP IROM {p:?}")))
+        .transpose()?;
 
-    let coef_rom = match cli.coef {
-        Some(p) => std::fs::read(&p).with_context(|| format!("read DSP COEF ROM {p:?}"))?,
-        None => DEFAULT_COEF_ROM.to_vec(),
-    };
+    let coef_rom = cli
+        .coef
+        .map(|p| std::fs::read(&p).with_context(|| format!("read DSP COEF ROM {p:?}")))
+        .transpose()?;
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -109,8 +109,8 @@ fn main() -> Result<()> {
         Some(boot::boot_dol(
             bytes,
             cli.wii,
-            &shared.dsp_rom,
-            &shared.coef_rom,
+            shared.dsp_rom.as_deref(),
+            shared.coef_rom.as_deref(),
             shared.gx.clone(),
             shared.device.clone(),
             shared.queue.clone(),
@@ -120,9 +120,9 @@ fn main() -> Result<()> {
         let bytes = std::fs::read(dvd_path).with_context(|| format!("read DVD {dvd_path:?}"))?;
         Some(boot::boot(
             bytes,
-            &shared.ipl,
-            &shared.dsp_rom,
-            &shared.coef_rom,
+            shared.ipl.as_deref(),
+            shared.dsp_rom.as_deref(),
+            shared.coef_rom.as_deref(),
             shared.gx.clone(),
             shared.device.clone(),
             shared.queue.clone(),

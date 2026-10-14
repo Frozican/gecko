@@ -1,9 +1,9 @@
-use iced::widget::{button, container, row, text};
+use iced::widget::{Space, button, container, row, text};
 use iced::{Background, Border, Color, Element, Length, Padding};
 use iced_aw::menu::{self, Item, Menu, MenuBar};
 
 use crate::app::Message;
-use crate::game::{CpuMode, Platform, ThemePreference};
+use crate::game::{AspectMode, CpuMode, Platform, ThemePreference};
 use crate::theme::Palette;
 
 const COMMUNITY_COMPAT_URL: &str = "https://gecko.layle.dev/compat";
@@ -14,8 +14,11 @@ pub fn menubar(
     palette: &Palette,
     cpu: CpuMode,
     theme_pref: ThemePreference,
+    ipl_hle: bool,
     skip_ipl: bool,
     upscale: u32,
+    texture_packs: bool,
+    aspect: AspectMode,
     memcard_enabled: bool,
     sram_enabled: bool,
 ) -> Element<'static, Message> {
@@ -31,8 +34,11 @@ pub fn menubar(
                 palette,
                 cpu,
                 theme_pref,
+                ipl_hle,
                 skip_ipl,
                 upscale,
+                texture_packs,
+                aspect,
                 memcard_enabled,
                 sram_enabled,
             ),
@@ -232,93 +238,106 @@ fn settings_menu(
     palette: &Palette,
     cpu: CpuMode,
     theme_pref: ThemePreference,
+    ipl_hle: bool,
     skip_ipl: bool,
     upscale: u32,
+    texture_packs: bool,
+    aspect: AspectMode,
     memcard_enabled: bool,
     sram_enabled: bool,
 ) -> Menu<'static, Message, iced::Theme, iced::Renderer> {
+    let check = |label: &'static str, msg: Message, on: bool| Item::new(self::menu_item(palette, label, msg, Some(on)));
+
+    let mut boot_items = vec![check("IPL HLE (GameCube)", Message::MenuToggleIplHle, ipl_hle)];
+    if !ipl_hle {
+        boot_items.push(check("Skip IPL (GameCube)", Message::MenuToggleSkipIpl, skip_ipl));
+    }
+    boot_items.extend([
+        check("Memory Card (Slot A)", Message::MenuToggleMemoryCard, memcard_enabled),
+        check("Persist SRAM", Message::MenuToggleSram, sram_enabled),
+    ]);
+
     Menu::new(vec![
-        Item::new(self::section_header(palette, "Execution Engine")),
-        Item::new(self::menu_item(
-            palette,
-            "JIT (Recompiler)",
-            Message::MenuToggleCpu(CpuMode::Jit),
-            Some(cpu == CpuMode::Jit),
-        )),
-        Item::new(self::menu_item(
-            palette,
-            "Interpreter",
-            Message::MenuToggleCpu(CpuMode::Interpreter),
-            Some(cpu == CpuMode::Interpreter),
-        )),
+        Item::new(self::menu_item(palette, "Guided Setup...", Message::MenuSetup, None)),
         Item::new(self::separator(palette)),
-        Item::new(self::section_header(palette, "Boot")),
-        Item::new(self::menu_item(
+        self::submenu(
             palette,
-            "Skip IPL (GameCube)",
-            Message::MenuToggleSkipIpl,
-            Some(skip_ipl),
-        )),
-        Item::new(self::menu_item(
+            "Execution Engine",
+            vec![
+                check(
+                    "JIT (Recompiler)",
+                    Message::MenuToggleCpu(CpuMode::Jit),
+                    cpu == CpuMode::Jit,
+                ),
+                check(
+                    "Interpreter",
+                    Message::MenuToggleCpu(CpuMode::Interpreter),
+                    cpu == CpuMode::Interpreter,
+                ),
+            ],
+        ),
+        self::submenu(palette, "Boot", boot_items),
+        self::submenu(
             palette,
-            "Memory Card (Slot A)",
-            Message::MenuToggleMemoryCard,
-            Some(memcard_enabled),
-        )),
-        Item::new(self::menu_item(
+            "Graphics",
+            vec![
+                check(
+                    "Texture Packs (restart game)",
+                    Message::MenuToggleTexturePacks,
+                    texture_packs,
+                ),
+                Item::new(self::separator(palette)),
+                Item::new(self::section_header(palette, "Internal Resolution")),
+                check("1x (Native)", Message::MenuSetUpscale(1), upscale == 1),
+                check("2x", Message::MenuSetUpscale(2), upscale == 2),
+                check("3x", Message::MenuSetUpscale(3), upscale == 3),
+                check("4x", Message::MenuSetUpscale(4), upscale == 4),
+                Item::new(self::separator(palette)),
+                Item::new(self::section_header(palette, "Aspect Ratio")),
+                check(
+                    "Auto (16:9 Wii, 4:3 GC)",
+                    Message::MenuSetAspect(AspectMode::Auto),
+                    aspect == AspectMode::Auto,
+                ),
+                check(
+                    "4:3",
+                    Message::MenuSetAspect(AspectMode::Standard),
+                    aspect == AspectMode::Standard,
+                ),
+                check(
+                    "16:9",
+                    Message::MenuSetAspect(AspectMode::Widescreen),
+                    aspect == AspectMode::Widescreen,
+                ),
+                check(
+                    "Stretch",
+                    Message::MenuSetAspect(AspectMode::Stretch),
+                    aspect == AspectMode::Stretch,
+                ),
+            ],
+        ),
+        self::submenu(
             palette,
-            "Persist SRAM",
-            Message::MenuToggleSram,
-            Some(sram_enabled),
-        )),
+            "Theme",
+            vec![
+                check(
+                    "System",
+                    Message::MenuSetTheme(ThemePreference::System),
+                    theme_pref == ThemePreference::System,
+                ),
+                check(
+                    "Light",
+                    Message::MenuSetTheme(ThemePreference::Light),
+                    theme_pref == ThemePreference::Light,
+                ),
+                check(
+                    "Dark",
+                    Message::MenuSetTheme(ThemePreference::Dark),
+                    theme_pref == ThemePreference::Dark,
+                ),
+            ],
+        ),
         Item::new(self::separator(palette)),
-        Item::new(self::section_header(palette, "Internal Resolution")),
-        Item::new(self::menu_item(
-            palette,
-            "1x (Native)",
-            Message::MenuSetUpscale(1),
-            Some(upscale == 1),
-        )),
-        Item::new(self::menu_item(
-            palette,
-            "2x",
-            Message::MenuSetUpscale(2),
-            Some(upscale == 2),
-        )),
-        Item::new(self::menu_item(
-            palette,
-            "3x",
-            Message::MenuSetUpscale(3),
-            Some(upscale == 3),
-        )),
-        Item::new(self::menu_item(
-            palette,
-            "4x",
-            Message::MenuSetUpscale(4),
-            Some(upscale == 4),
-        )),
-        Item::new(self::separator(palette)),
-        Item::new(self::section_header(palette, "Theme")),
-        Item::new(self::menu_item(
-            palette,
-            "System",
-            Message::MenuSetTheme(ThemePreference::System),
-            Some(theme_pref == ThemePreference::System),
-        )),
-        Item::new(self::menu_item(
-            palette,
-            "Light",
-            Message::MenuSetTheme(ThemePreference::Light),
-            Some(theme_pref == ThemePreference::Light),
-        )),
-        Item::new(self::menu_item(
-            palette,
-            "Dark",
-            Message::MenuSetTheme(ThemePreference::Dark),
-            Some(theme_pref == ThemePreference::Dark),
-        )),
-        Item::new(self::separator(palette)),
-        Item::new(self::section_header(palette, "Input")),
         Item::new(self::menu_item(
             palette,
             "Controller Bindings",
@@ -335,6 +354,34 @@ fn settings_menu(
     .max_width(240.0)
     .offset(4.0)
     .spacing(2.0)
+}
+
+fn submenu(
+    palette: &Palette,
+    label: &'static str,
+    items: Vec<Item<'static, Message, iced::Theme, iced::Renderer>>,
+) -> Item<'static, Message, iced::Theme, iced::Renderer> {
+    let text_color = palette.text;
+    let hover = palette.surface_2;
+    let content = row![
+        text(label).size(13).color(text_color),
+        Space::new().width(Length::Fill),
+        crate::widgets::icons::chevron_right(palette.text_dim),
+    ]
+    .align_y(iced::Alignment::Center);
+
+    let header = button(content)
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 6.0,
+            right: 10.0,
+            bottom: 6.0,
+            left: 14.0,
+        })
+        .on_press(Message::Noop)
+        .style(move |_, status| self::menu_item_style(status, hover, text_color));
+
+    Item::with_menu(header, Menu::new(items).max_width(220.0).offset(6.0).spacing(2.0))
 }
 
 fn compatibility_menu(palette: &Palette) -> Menu<'static, Message, iced::Theme, iced::Renderer> {

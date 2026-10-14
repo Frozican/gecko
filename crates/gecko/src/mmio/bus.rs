@@ -80,12 +80,26 @@ macro_rules! bus_write_hooks {
 }
 
 impl<const SYSTEM: SystemId> System<SYSTEM> {
+    pub(crate) fn refresh_lcache_fastmem(&mut self) {
+        let base = crate::mmio::constants::LCACHE_BASE;
+        self.mmio.lcache_fastmem_ptr = if self.bat_translate(base) == base {
+            self.mmio.lcache.as_ptr() as usize
+        } else {
+            0
+        };
+        self.mmio.fastmem_lut[(base >> crate::mmio::FASTMEM_PAGE_SHIFT) as usize] = self.mmio.lcache_fastmem_ptr;
+    }
+
     #[cold]
     pub(crate) fn sync_deferred_efb_writeback(&mut self, phys: u32, len: usize) {
         if !self.mmio.efb_writeback_needed(phys, len) {
             return;
         }
 
+        self.flush_deferred_efb_writebacks();
+    }
+
+    pub(crate) fn flush_deferred_efb_writebacks(&mut self) {
         let mut ram = self.mmio.ram_view_mut();
         self.render_sink.flush_efb_copies(&mut ram);
         self.mmio.clear_deferred_efb_writebacks();

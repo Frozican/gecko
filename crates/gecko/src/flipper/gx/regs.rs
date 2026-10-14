@@ -102,6 +102,15 @@ pub struct BlendMode {
     pub logic_op: LogicOp,
 }
 
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DstAlpha {
+    #[bits(0..=7)]
+    pub alpha: u8,
+    #[bits(8)]
+    pub enable: bool,
+}
+
 #[derive(Debug, PartialEq, BitEnum, Hash, Eq)]
 pub enum PixelFormat {
     Rgb8Z24 = 0,
@@ -256,15 +265,11 @@ pub enum ColorFormat {
 }
 
 impl ColorFormat {
-    pub fn data_size(&self, count: ColorCount) -> usize {
-        match (self, count) {
-            (ColorFormat::Rgb565, _) => 2,
-            (ColorFormat::Rgb8, _) => 3,
-            (ColorFormat::Rgbx8, _) => 4,
-            (ColorFormat::Rgba4, _) => 2,
-            (ColorFormat::Rgba6, _) => 3,
-            (ColorFormat::Rgba8, ColorCount::Rgb) => 3,
-            (ColorFormat::Rgba8, ColorCount::Rgba) => 4,
+    pub fn data_size(&self) -> usize {
+        match self {
+            ColorFormat::Rgb565 | ColorFormat::Rgba4 => 2,
+            ColorFormat::Rgb8 | ColorFormat::Rgba6 => 3,
+            ColorFormat::Rgbx8 | ColorFormat::Rgba8 => 4,
         }
     }
 }
@@ -367,11 +372,11 @@ impl VatA {
     }
 
     pub fn clr0_data_size(&self) -> usize {
-        self.clr0_fmt().data_size(self.clr0_cnt())
+        self.clr0_fmt().data_size()
     }
 
     pub fn clr1_data_size(&self) -> usize {
-        self.clr1_fmt().data_size(self.clr1_cnt())
+        self.clr1_fmt().data_size()
     }
 
     pub fn tex0_data_size(&self) -> usize {
@@ -587,6 +592,67 @@ pub struct TxSetImage0 {
 
 #[chapa::bitfield(u32, order = lsb0)]
 #[derive(Debug, Clone, Copy)]
+pub struct TxSetImage1 {
+    #[bits(0..=14)]
+    pub tmem_even: u16,
+    #[bits(15..=17)]
+    pub cache_width: u8,
+    #[bits(18..=20)]
+    pub cache_height: u8,
+    #[bits(21)]
+    pub manually_managed: bool,
+}
+
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy)]
+pub struct TxSetImage2 {
+    #[bits(0..=14)]
+    pub tmem_odd: u16,
+    #[bits(15..=17)]
+    pub cache_width: u8,
+    #[bits(18..=20)]
+    pub cache_height: u8,
+}
+
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy)]
+pub struct PreloadMode {
+    #[bits(0..=14)]
+    pub count: u16,
+    #[bits(15..=16)]
+    pub tile_type: u8,
+}
+
+impl PreloadMode {
+    pub fn split_banks(&self) -> bool {
+        self.tile_type() == 3
+    }
+}
+
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy)]
+pub struct PreloadAddress {
+    #[bits(0..=23)]
+    pub address: u32,
+}
+
+impl PreloadAddress {
+    pub fn byte_address(&self) -> usize {
+        self.address() as usize * super::constants::TMEM_LINE_SIZE
+    }
+}
+
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy)]
+pub struct LoadTlut1 {
+    #[bits(0..=9)]
+    pub tmem_offset: u16,
+    #[bits(10..=20)]
+    pub count: u16,
+}
+
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy)]
 pub struct TxSetImage3 {
     #[bits(0..=23)]
     pub image_base: u32,
@@ -620,6 +686,12 @@ pub enum MinFilter {
     Linear = 4,
     LinearMipmapNearest = 5,
     LinearMipmapLinear = 6,
+}
+
+impl MinFilter {
+    pub fn uses_mipmaps(self) -> bool {
+        !matches!(self, Self::Nearest | Self::Linear)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, BitEnum)]
@@ -693,6 +765,18 @@ pub struct TxSetMode0 {
 
     #[bits(5..=7)]
     pub min_filter: MinFilter,
+
+    #[bits(9..=16)]
+    pub lod_bias: u8,
+}
+
+#[chapa::bitfield(u32, order = lsb0)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TxSetMode1 {
+    #[bits(0..=7)]
+    pub min_lod: u8,
+    #[bits(8..=15)]
+    pub max_lod: u8,
 }
 
 // TEV color combiner input select (SELA-SELD)
@@ -912,6 +996,8 @@ pub struct GenMode {
     pub cull_mode: CullMode,
     #[bits(16..=18)]
     pub num_ind_stages: u8,
+    #[bits(19)]
+    pub z_freeze: bool,
 }
 
 #[derive(Debug, PartialEq, BitEnum)]

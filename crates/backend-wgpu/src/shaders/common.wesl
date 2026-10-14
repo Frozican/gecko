@@ -20,6 +20,7 @@ struct FrameUniforms {
     indirect_refs: u32,
     num_indirect_stages: u32,
     bump_imask: u32,
+    texgen_types: u32,
     tev_indirect: array<vec4<u32>, 4>,
     // XF lighting state
     light_colors: array<vec4<f32>, 8>,
@@ -40,7 +41,9 @@ struct FrameUniforms {
     ztex_bias: u32,
     ztex_type: u32,
     ztex_op: u32,
-    _pad2: u32,
+    dst_alpha: u32,
+    zfreeze_plane: vec4<f32>,
+    texcoord_scales: array<vec4<u32>, 4>,
 };
 
 struct DrawUniforms {
@@ -50,6 +53,7 @@ struct DrawUniforms {
     // a larger GPU texture, so textureDimensions must not be used for
     // guest texel math.
     tex_dims: array<vec4<u32>, 4>,
+    tex_lod_bias: array<vec4<f32>, 2>,
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;

@@ -22,6 +22,7 @@ jit-stats = ["jit", "dep:backtrace"]
 # Run both interpreter and JIT for every draw call, reports drift
 vtx-jit-validate = ["jit", "gx-stats"]
 fps-counter = []
+frame-timings = []
 gx-stats = []
 profile = ["dep:backtrace", "dep:windows-sys"]
 # Enables std::hint::black_box inside `EmptyRenderSink::exec`
@@ -37,7 +38,7 @@ dff = { path = "../dff" }
 tracing = "0.1.44"
 image = { path = "../image", default-features = false }
 disasm = { path = "../disasm" }
-glam = { version = "0.32.1", features = ["bytemuck"] }
+glam = { version = "0.33.7", features = ["bytemuck"] }
 bytemuck = { version = "1.25.0", features = ["derive"] }
 twox-hash = "2.1.2"
 crossbeam-channel = "0.5.15"

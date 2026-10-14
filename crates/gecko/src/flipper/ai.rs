@@ -74,9 +74,7 @@ pub fn start_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     }
 
     sys.scheduler.cancel(crate::scheduler::Handler::AiAudioDmaBlock);
-    sys.ai.audio_dma_remaining_blocks = blocks;
-    sys.ai.audio_dma_current_addr = sys.dsp.audio_dma_start_addr.raw();
-    sys.dsp.csr.set_dma_status(true);
+    self::latch_audio_dma(sys);
 
     let addr = sys.dsp.audio_dma_start_addr.raw();
     let len = blocks as u32 * AUDIO_DMA_BLOCK_BYTES;
@@ -90,10 +88,15 @@ pub fn start_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
 }
 
 #[inline(always)]
+fn latch_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
+    sys.ai.audio_dma_remaining_blocks = sys.dsp.audio_dma_control.length();
+    sys.ai.audio_dma_current_addr = sys.dsp.audio_dma_start_addr.raw();
+}
+
+#[inline(always)]
 pub fn stop_audio_dma<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     sys.scheduler.cancel(crate::scheduler::Handler::AiAudioDmaBlock);
     sys.ai.audio_dma_remaining_blocks = 0;
-    sys.dsp.csr.set_dma_status(false);
 }
 
 #[inline(always)]
@@ -105,8 +108,7 @@ pub fn audio_dma_block_handler<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>)
     }
 
     if sys.ai.audio_dma_remaining_blocks == 0 {
-        sys.ai.audio_dma_remaining_blocks = sys.dsp.audio_dma_control.length();
-        sys.ai.audio_dma_current_addr = sys.dsp.audio_dma_start_addr.raw();
+        self::latch_audio_dma(sys);
     }
 
     if sys.ai.audio_dma_remaining_blocks == 0 {
@@ -130,6 +132,7 @@ pub fn audio_dma_block_handler<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>)
     sys.ai.audio_dma_remaining_blocks -= 1;
 
     if sys.ai.audio_dma_remaining_blocks == 0 {
+        self::latch_audio_dma(sys);
         sys.dsp.csr.set_ai_interrupt(true);
         dsp::refresh_interrupts(sys);
 
@@ -143,7 +146,6 @@ pub fn audio_dma_block_handler<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>)
     }
 
     if sys.dsp.audio_dma_control.play() {
-        sys.dsp.csr.set_dma_status(true);
         sys.scheduler.schedule_in(
             cycles_per_audio_dma_block(sys),
             crate::scheduler::Handler::AiAudioDmaBlock,

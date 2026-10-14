@@ -88,15 +88,23 @@ struct Args {
     #[arg(long)]
     immediate: bool,
 
+    /// Disable Dolphin texture replacements from the texturepacks directory
+    #[arg(long)]
+    no_texture_packs: bool,
+
+    /// Override the texture pack root (defaults to texturepacks in the data directory)
+    #[arg(long)]
+    texture_pack_dir: Option<std::path::PathBuf>,
+
     /// Disable ANSI escape codes
     #[arg(long)]
     no_ansi: bool,
 
-    /// Path to a DSP IROM binary
+    /// Path to a DSP IROM binary (defaults to Dolphin's DSP ROM)
     #[arg(long)]
     dsp: Option<String>,
 
-    /// Path to a DSP coefficient ROM binary
+    /// Path to a DSP coefficient ROM binary (defaults to Dolphin's DSP ROM)
     #[arg(long)]
     coef: Option<String>,
 
@@ -105,7 +113,8 @@ struct Args {
     #[arg(long)]
     script: Option<String>,
 
-    /// Display aspect ratio: auto (16:9 Wii / 4:3 GC), 4:3, 16:9, stretch
+    /// Display aspect ratio: auto (16:9 Wii / 4:3 GC), 4:3, 16:9, stretch.
+    /// On Wii this also sets the console's widescreen setting (SYSCONF IPL.AR).
     #[arg(long, default_value = "auto")]
     aspect: String,
 
@@ -174,6 +183,14 @@ struct Args {
     /// Wiimote pointer source: auto, gyro, stick, touchpad, or mouse
     #[arg(long, default_value = "mouse")]
     pointer: String,
+
+    /// Start with the Nunchuk detached (F8 toggles attachment)
+    #[arg(long)]
+    no_nunchuk: bool,
+
+    /// Hold the Wiimote sideways (F9 toggles orientation)
+    #[arg(long)]
+    sideways: bool,
 
     /// Force interpreter dispatch for CPU/DSP/Vertex (default: JIT)
     #[arg(long)]
@@ -260,12 +277,17 @@ fn main() {
     } else if let Some(ref ipl_path) = args.ipl {
         let ipl_data = std::fs::read(ipl_path).expect("failed to read IPL");
         let mut emulator = GameCube::with_ipl(&ipl_data, args.skip_ipl);
-        if let Some(ref dvd_path) = args.dvd {
+        let game_id = if let Some(ref dvd_path) = args.dvd {
             let dvd_data = std::fs::read(dvd_path).expect("failed to read DVD");
-            emulator.insert_dvd(image::load_dvd(dvd_data));
-        }
+            let dvd = image::load_dvd(dvd_data);
+            let game_id = dvd.header().game_id();
+            emulator.insert_dvd(dvd);
+            Some(game_id)
+        } else {
+            None
+        };
         configure(&mut emulator, &args);
-        run(emulator, present_mode, &args, None);
+        run(emulator, present_mode, &args, game_id);
     } else if let Some(ref dvd_path) = args.dvd {
         let dvd_data = std::fs::read(dvd_path).expect("failed to read DVD");
         let dvd = image::load_dvd(dvd_data);
@@ -301,6 +323,11 @@ fn configure<const SYSTEM: SystemId>(emulator: &mut System<SYSTEM>, args: &Args)
         gecko::ExecutionMode::Jit
     });
 
+    if SYSTEM == system::WII {
+        let widescreen = TargetAspect::from_arg(&args.aspect, true).is_widescreen();
+        emulator.starlet.set_widescreen(widescreen);
+    }
+
     if let Some(ref dsp_path) = args.dsp {
         let dsp_data = std::fs::read(dsp_path).expect("failed to read DSP IROM");
         emulator.dsp.load_irom(&dsp_data);
@@ -331,7 +358,7 @@ fn configure<const SYSTEM: SystemId>(emulator: &mut System<SYSTEM>, args: &Args)
         }
     }
 
-    emulator.apply_host_input(&HostInput::neutral_for(SYSTEM));
+    emulator.apply_host_input(&HostInput::neutral_for(SYSTEM).with_wii_options(!args.no_nunchuk, args.sideways));
 
     #[cfg(any(feature = "jit-stats", feature = "gx-stats"))]
     {
@@ -386,6 +413,15 @@ fn run<const SYSTEM: SystemId>(
         args.upscale,
     );
 
+    if !args.no_texture_packs
+        && let Some(id) = game_id.as_deref()
+    {
+        let root = args
+            .texture_pack_dir
+            .clone()
+            .unwrap_or_else(|| gecko::paths::resolve("texturepacks"));
+        sink.load_texture_pack(&root, id);
+    }
     emulator.render_sink = Box::new(sink);
 
     let audio_stream = install_audio_sink(args, &mut emulator);
@@ -398,7 +434,9 @@ fn run<const SYSTEM: SystemId>(
         let _ = std::fs::write(path, "wall_secs,fps,native_pct,vsyncs\n");
     }
 
-    let input = Arc::new(Mutex::new(HostInput::neutral_for(SYSTEM)));
+    let input = Arc::new(Mutex::new(
+        HostInput::neutral_for(SYSTEM).with_wii_options(!args.no_nunchuk, args.sideways),
+    ));
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
@@ -469,6 +507,8 @@ fn run<const SYSTEM: SystemId>(
 
     let mut input_config = hostinput::InputConfig::default();
     input_config.wii.pointer = Some(args.pointer.clone());
+    input_config.wii.nunchuk_attached = Some(!args.no_nunchuk);
+    input_config.wii.sideways = Some(args.sideways);
 
     drop(proxy);
     let emu_savestate_requests = savestate_requests.clone();
@@ -492,6 +532,7 @@ fn run<const SYSTEM: SystemId>(
 
     let mut app = app::App {
         input,
+        wii_notice: None,
         window: None,
         state: None,
         present_mode,

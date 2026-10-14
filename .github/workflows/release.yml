@@ -38,7 +38,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Init submodules
-        run: git submodule update --init --depth 1 --recursive submodules/chipi-spec submodules/solstice
+        run: |
+          git submodule update --init --depth 1 --recursive submodules/chipi-spec submodules/solstice
+          git submodule update --init --depth 1 submodules/dolphin
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -108,7 +110,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Init submodules
-        run: git submodule update --init --depth 1 --recursive submodules/chipi-spec submodules/solstice
+        run: |
+          git submodule update --init --depth 1 --recursive submodules/chipi-spec submodules/solstice
+          git submodule update --init --depth 1 submodules/dolphin
 
       - uses: dtolnay/rust-toolchain@stable
         with:

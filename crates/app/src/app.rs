@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use backend_wgpu::capture;
@@ -11,10 +11,11 @@ use iced::{Background, Border, Color, Element, Length, Padding, Subscription, Ta
 
 use crate::cache::{self, LibraryCache};
 use crate::config::{self, Config};
-use crate::game::{CpuMode, Format, Game, Platform, ThemePreference};
+use crate::game::{AspectMode, CpuMode, Format, Game, Platform, ThemePreference};
 use crate::keybinds::{self, KeyTarget};
 use crate::library::{self, ScanProgress};
 use crate::player::{self, PlayerState, PlayerStatus};
+use crate::setup::{self, Field, Setup, Step};
 use crate::theme::{self, Palette};
 use crate::update::{self, Outcome};
 use crate::widgets::input_settings::{self, BindTarget, InputTab, InvertTarget, KeyboardTab};
@@ -28,9 +29,21 @@ const TOAST_DURATION: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone)]
 pub enum Message {
     Noop,
+    MenuSetup,
+    SetupClose,
+    SetupBack,
+    SetupNext,
+    SetupPick(Field),
+    SetupClear(Field),
+    SetupPicked(Field, Option<PathBuf>),
+    SetupValidated(Result<(), String>),
+    SetupInstall,
+    SetupInstalled(Result<Box<Config>, String>),
     LibraryWindowOpened(window::Id),
     PlayerWindowOpened(window::Id, Box<Game>, Arc<PlayerState>),
     PlayerTick,
+    PlayerCaptureMouse(window::Id, bool),
+    PlayerFocused(window::Id, bool),
     WindowClosed(window::Id),
     LibraryPicked(Platform, Option<PathBuf>),
     ScanRequested,
@@ -46,10 +59,13 @@ pub enum Message {
     MenuQuit,
     MenuToggleCpu(CpuMode),
     MenuToggleSkipIpl,
+    MenuToggleIplHle,
     MenuToggleMemoryCard,
     MenuToggleSram,
     MenuSetTheme(ThemePreference),
     MenuSetUpscale(u32),
+    MenuToggleTexturePacks,
+    MenuSetAspect(AspectMode),
     MenuAbout,
     AboutClose,
     MenuInputSettings,
@@ -60,7 +76,10 @@ pub enum Message {
     InputTick,
     InputPointer(String),
     InputSensitivity(f32),
-    InputToggleSideways,
+    WiiPreset(crate::config::WiiPresetId),
+    WiiPresetReset,
+    InputToggleNunchuk,
+    InputToggleLeftStick,
     InputToggleStickDpad,
     InputToggleInvert(InvertTarget),
     InputReset,
@@ -115,6 +134,9 @@ pub struct PlayerWindow {
     pub(crate) game: Game,
     pub(crate) state: Arc<PlayerState>,
     pub(crate) fullscreen: bool,
+    pub(crate) mouse_capture: Arc<Mutex<player::MouseCapture>>,
+    pub(crate) capture_intent: bool,
+    pub(crate) captured: bool,
     pub(crate) overlay: bool,
     pub(crate) toast: Option<Toast>,
 }
@@ -128,6 +150,7 @@ pub struct App {
     search: String,
     search_lc: String,
     scanning: bool,
+    setup: Option<Setup>,
     about_open: bool,
     input_open: bool,
     input_tab: InputTab,
@@ -147,7 +170,11 @@ pub struct App {
 
 impl App {
     pub fn boot(cli_gcn: Option<PathBuf>, cli_wii: Option<PathBuf>) -> (Self, Task<Message>) {
-        let config = config::load(&config::config_path());
+        let config_path = config::config_path();
+        let config = config::load(&config_path);
+        let setup = Setup::new(&config, cli_gcn.clone(), cli_wii.clone());
+        let setup = setup.needed(&config, config_path.is_file()).then_some(setup);
+
         let cache = cache::load(&cache::cache_path());
 
         let mut games: Vec<Game> = cache.entries.values().map(|e| e.game.clone()).collect();
@@ -166,6 +193,7 @@ impl App {
             search: String::new(),
             search_lc: String::new(),
             scanning: false,
+            setup,
             about_open: false,
             input_open: false,
             input_tab: InputTab::Gc,
@@ -236,11 +264,120 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Noop => Task::none(),
+            Message::MenuSetup => {
+                if self.setup.is_none() {
+                    self.setup = Some(Setup::new(
+                        &self.config,
+                        self.cli_gcn_override.clone(),
+                        self.cli_wii_override.clone(),
+                    ));
+                }
+                Task::none()
+            }
+            Message::SetupClose => {
+                if self.idle_setup().is_some() {
+                    self.setup = None;
+                }
+                Task::none()
+            }
+            Message::SetupBack => {
+                if let Some(setup) = self.idle_setup() {
+                    setup.step = setup.step.prev();
+                    setup.error = None;
+                }
+                Task::none()
+            }
+            Message::SetupClear(field) => {
+                if let Some(setup) = self.idle_setup() {
+                    *setup.sources.path_mut(field) = None;
+                    setup.error = None;
+                }
+                Task::none()
+            }
+            Message::SetupPick(field) => {
+                let Some(setup) = self.idle_setup() else {
+                    return Task::none();
+                };
+
+                setup.busy = true;
+                Task::perform(setup::pick(field), move |path| Message::SetupPicked(field, path))
+            }
+            Message::SetupPicked(field, path) => {
+                if let Some(setup) = &mut self.setup {
+                    setup.busy = false;
+                    if path.is_some() {
+                        *setup.sources.path_mut(field) = path;
+                        setup.error = None;
+                    }
+                }
+                Task::none()
+            }
+            Message::SetupNext => {
+                let Some(setup) = self.idle_setup().filter(|s| s.step != Step::Finish) else {
+                    return Task::none();
+                };
+
+                setup.busy = true;
+                setup.error = None;
+                let sources = setup.sources.clone();
+                let step = setup.step;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            setup::validate_step(&sources, step).map_err(|e| format!("{e:#}"))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::SetupValidated,
+                )
+            }
+            Message::SetupValidated(result) => {
+                if let Some(setup) = &mut self.setup {
+                    setup.busy = false;
+                    match result {
+                        Ok(()) => setup.step = setup.step.next(),
+                        Err(error) => setup.error = Some(error),
+                    }
+                }
+                Task::none()
+            }
+            Message::SetupInstall => {
+                let Some(setup) = self.idle_setup().filter(|s| s.step == Step::Finish) else {
+                    return Task::none();
+                };
+
+                setup.busy = true;
+                setup.error = None;
+                let sources = setup.sources.clone();
+                Task::perform(setup::run_install(sources, self.config.clone()), |result| {
+                    Message::SetupInstalled(result.map(Box::new))
+                })
+            }
+            Message::SetupInstalled(result) => {
+                match result {
+                    Ok(config) => {
+                        self.config = *config;
+                        self.setup = None;
+                        self.cli_gcn_override = None;
+                        self.cli_wii_override = None;
+                        return Task::done(Message::ScanRequested);
+                    }
+                    Err(error) => {
+                        if let Some(setup) = &mut self.setup {
+                            setup.busy = false;
+                            setup.error = Some(error);
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::LibraryWindowOpened(id) => {
                 self.library_window = Some(id);
                 Task::none()
             }
             Message::PlayerWindowOpened(id, game, state) => {
+                state.refresh_wii_input(&self.config);
                 tracing::info!(window = ?id, title = %game.title, "player window opened");
                 self.players.insert(
                     id,
@@ -248,15 +385,41 @@ impl App {
                         game: *game,
                         state,
                         fullscreen: false,
+                        mouse_capture: Arc::new(Mutex::new(player::MouseCapture::default())),
+                        capture_intent: false,
+                        captured: false,
                         overlay: false,
                         toast: None,
                     },
                 );
                 Task::none()
             }
+            Message::PlayerCaptureMouse(id, capture) => {
+                let Some(player) = self.players.get_mut(&id) else {
+                    return Task::none();
+                };
+
+                player.capture_intent = capture;
+                self.apply_mouse_capture(id, capture)
+            }
+            Message::PlayerFocused(id, focused) => {
+                let Some(player) = self.players.get(&id) else {
+                    return Task::none();
+                };
+
+                if !focused {
+                    player.state.clear_input();
+                }
+
+                let capture = focused && player.capture_intent;
+                self.apply_mouse_capture(id, capture)
+            }
             Message::PlayerTick => {
                 let now = Instant::now();
                 for player in self.players.values_mut() {
+                    if player.captured {
+                        player.mouse_capture.lock().unwrap().poll();
+                    }
                     if player.toast.as_ref().is_some_and(|t| now >= t.expires) {
                         player.toast = None;
                     }
@@ -286,10 +449,6 @@ impl App {
             }
             Message::ScanRequested => {
                 let roots = self.effective_library_roots();
-                if roots.is_empty() {
-                    return Task::none();
-                }
-
                 self.scanning = true;
                 let prior = self.cache.clone();
                 Task::stream(library::scan_library_stream(roots, prior)).map(Message::ScanProgress)
@@ -304,9 +463,12 @@ impl App {
                 self.insert_game_sorted(*game);
                 Task::none()
             }
+            Message::ScanProgress(ScanProgress::Checkpoint(cache)) => {
+                self.cache = *cache;
+                Task::none()
+            }
             Message::ScanProgress(ScanProgress::Finished(cache)) => {
                 self.cache = *cache;
-                self.persist_cache();
                 self.scanning = false;
                 tracing::info!(total = self.games.len(), "scan finished");
                 Task::none()
@@ -374,7 +536,7 @@ impl App {
 
                 Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || library::load_one(&path, format).map(Box::new))
+                        tokio::task::spawn_blocking(move || library::load_header(&path, format).map(Box::new))
                             .await
                             .unwrap_or_else(|err| Err(err.to_string()))
                     },
@@ -411,6 +573,11 @@ impl App {
                 self.persist_config();
                 Task::none()
             }
+            Message::MenuToggleIplHle => {
+                self.config.ipl_hle = !self.config.ipl_hle;
+                self.persist_config();
+                Task::none()
+            }
             Message::MenuToggleSkipIpl => {
                 self.config.skip_ipl = !self.config.skip_ipl;
                 self.persist_config();
@@ -434,6 +601,16 @@ impl App {
             }
             Message::MenuSetUpscale(scale) => {
                 self.config.upscale = scale;
+                self.persist_config();
+                Task::none()
+            }
+            Message::MenuToggleTexturePacks => {
+                self.config.texture_packs = !self.config.texture_packs;
+                self.persist_config();
+                Task::none()
+            }
+            Message::MenuSetAspect(aspect) => {
+                self.config.aspect = aspect;
                 self.persist_config();
                 Task::none()
             }
@@ -514,9 +691,29 @@ impl App {
                 self.persist_config();
                 Task::none()
             }
-            Message::InputToggleSideways => {
-                let current = self.config.input.wii.sideways.unwrap_or(false);
-                self.config.input.wii.sideways = Some(!current);
+            Message::WiiPreset(id) => {
+                self.config.select_wii_preset(id);
+                self.input_capture = None;
+                self.key_capture = None;
+                self.persist_config();
+                Task::none()
+            }
+            Message::WiiPresetReset => {
+                self.config.reset_wii_preset();
+                self.input_capture = None;
+                self.key_capture = None;
+                self.persist_config();
+                Task::none()
+            }
+            Message::InputToggleNunchuk => {
+                let current = self.config.input.wii.nunchuk_attached.unwrap_or(true);
+                self.config.input.wii.nunchuk_attached = Some(!current);
+                self.persist_config();
+                Task::none()
+            }
+            Message::InputToggleLeftStick => {
+                let current = self.config.input.wii.left_stick_dpad.unwrap_or(false);
+                self.config.input.wii.left_stick_dpad = Some(!current);
                 self.persist_config();
                 Task::none()
             }
@@ -533,7 +730,12 @@ impl App {
                 Task::none()
             }
             Message::InputReset => {
-                self.config.input = hostinput::InputConfig::default();
+                match self.input_tab {
+                    InputTab::Wii => {
+                        self.config.input.wii = config::WiiPreset::defaults(self.config.active_wii_preset()).controller
+                    }
+                    InputTab::Gc => self.config.input.gc = Default::default(),
+                }
                 self.input_capture = None;
                 self.persist_config();
                 Task::none()
@@ -557,7 +759,13 @@ impl App {
                 Task::none()
             }
             Message::KeyboardReset => {
-                self.config.keyboard = keybinds::KeyboardConfig::default();
+                match self.keyboard_tab {
+                    KeyboardTab::Wii => {
+                        self.config.keyboard.wii = config::WiiPreset::defaults(self.config.active_wii_preset()).keyboard
+                    }
+                    KeyboardTab::Gc => self.config.keyboard.gc = Default::default(),
+                    KeyboardTab::Hotkeys => self.config.keyboard.hotkeys = Default::default(),
+                }
                 self.key_capture = None;
                 self.persist_config();
                 Task::none()
@@ -722,7 +930,7 @@ impl App {
             let (msg, hint) = if self.scanning {
                 ("Scanning...", "Reading disc headers")
             } else if self.effective_library_roots().is_empty() {
-                ("No libraries set", "File → Set GameCube / Wii Folder...")
+                ("No libraries set", "Choose a GameCube or Wii folder from the File menu")
             } else {
                 ("No games found", "Drop ISO, RVZ, or ZIP files into the library folder")
             };
@@ -745,8 +953,11 @@ impl App {
                 palette,
                 self.config.cpu_mode,
                 self.config.theme,
+                self.config.ipl_hle,
                 self.config.skip_ipl,
                 self.config.upscale,
+                self.config.texture_packs,
+                self.config.aspect,
                 self.config.memcard_enabled,
                 self.config.sram_enabled,
             ),
@@ -783,6 +994,7 @@ impl App {
                     self.input_tab,
                     self.input_capture,
                     self.input_pad_name.as_deref(),
+                    self.config.active_wii_preset(),
                 )
             ]
             .into();
@@ -790,11 +1002,20 @@ impl App {
         if self.keyboard_open {
             root_element = stack![
                 root_element,
-                input_settings::keyboard_overlay(palette, &self.config.keyboard, self.keyboard_tab, self.key_capture)
+                input_settings::keyboard_overlay(
+                    palette,
+                    &self.config.keyboard,
+                    self.keyboard_tab,
+                    self.key_capture,
+                    self.config.active_wii_preset()
+                )
             ]
             .into();
         }
 
+        if let Some(setup) = &self.setup {
+            root_element = stack![root_element, setup.view(palette, &self.config)].into();
+        }
         root_element
     }
 
@@ -804,7 +1025,8 @@ impl App {
         let text_color = palette.text;
 
         let status = player.state.status();
-        let shader: Element<'a, Message> = player::shader_widget(player.state.clone(), window_id).into();
+        let shader: Element<'a, Message> =
+            player::shader_widget(player.state.clone(), window_id, player.captured).into();
 
         let overlay: Option<Element<'a, Message>> = match &status {
             PlayerStatus::Ready => None,
@@ -846,6 +1068,28 @@ impl App {
             .into()
     }
 
+    fn apply_mouse_capture(&mut self, id: window::Id, capture: bool) -> Task<Message> {
+        let Some(player) = self.players.get_mut(&id) else {
+            return Task::none();
+        };
+
+        let capture = capture && player.game.platform == Platform::Wii;
+        player.captured = capture;
+        let mouse_capture = player.mouse_capture.clone();
+
+        window::run(id, move |window| {
+            if let Err(error) = mouse_capture.lock().unwrap().set(window, capture) {
+                tracing::warn!(%error, "failed to change player mouse capture");
+            }
+            Message::Noop
+        })
+        .discard()
+    }
+
+    fn idle_setup(&mut self) -> Option<&mut Setup> {
+        self.setup.as_mut().filter(|s| !s.busy)
+    }
+
     fn effective_library_roots(&self) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         if let Some(p) = self
@@ -867,21 +1111,26 @@ impl App {
         roots
     }
 
-    fn persist_config(&self) {
+    fn persist_config(&mut self) {
+        self.config.store_wii_preset();
+        for player in self.players.values() {
+            player.state.refresh_wii_input(&self.config);
+        }
         let path = config::config_path();
         if let Err(err) = config::save(&path, &self.config) {
             tracing::warn!(%err, path = %path.display(), "failed to persist config");
         }
     }
 
-    fn persist_cache(&self) {
-        let path = cache::cache_path();
-        if let Err(err) = cache::save(&path, &self.cache) {
-            tracing::warn!(%err, path = %path.display(), "failed to persist library cache");
-        }
-    }
-
     fn insert_game_sorted(&mut self, game: Game) {
+        if let Some(index) = self.games.iter().position(|existing| existing.path == game.path) {
+            if self.games[index].title_lc == game.title_lc {
+                self.games[index] = game;
+                return;
+            }
+            self.games.remove(index);
+        }
+
         let pos = self
             .games
             .binary_search_by(|g| g.title_lc.cmp(&game.title_lc))

@@ -2,7 +2,7 @@ use crate::system::{System, SystemId, WII};
 use std::path::PathBuf;
 
 pub const STATE_MAGIC: [u8; 4] = *b"GKST";
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 4;
 
 const COMPRESSION_LEVEL: i32 = 1;
 
@@ -220,7 +220,7 @@ pub fn unpack(system: SystemId, data: &[u8]) -> Result<Vec<u8>, StateError> {
     }
 
     let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-    if version != STATE_VERSION {
+    if !(1..=STATE_VERSION).contains(&version) {
         return Err(StateError::UnsupportedVersion(version));
     }
 
@@ -242,9 +242,7 @@ pub fn unpack(system: SystemId, data: &[u8]) -> Result<Vec<u8>, StateError> {
 
 impl<const SYSTEM: SystemId> System<SYSTEM> {
     pub fn save_state(&mut self) -> Result<Vec<u8>, StateError> {
-        let mut ram = self.mmio.ram_view_mut();
-        self.render_sink.flush_efb_copies(&mut ram);
-        self.mmio.clear_deferred_efb_writebacks();
+        self.flush_deferred_efb_writebacks();
 
         let mut w = StateWriter::new();
 
@@ -274,13 +272,21 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
             w.pod(&self.hollywood);
         }
 
+        // Version 2 appends the DSP exception latch to preserve version 1 layouts
+        w.u8(self.dsp.pending_exceptions);
+        w.pod(&self.gx.zfreeze_plane);
+        // Version 4 extends the old palette-only snapshot to all of TMEM.
+        self.gx.save_tmem_tail(&mut w);
+
         self::pack(SYSTEM, &w.into_inner())
     }
 
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), StateError> {
-        self.mmio.clear_deferred_efb_writebacks();
         let payload = self::unpack(SYSTEM, data)?;
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let mut r = StateReader::new(&payload);
+
+        self.flush_deferred_efb_writebacks();
 
         self.vsync_pending = r.bool()?;
         self.vi_present_seen_this_frame = r.bool()?;
@@ -289,6 +295,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
 
         self.gekko = r.pod()?;
         self.mmio.load_state(&mut r)?;
+        self.refresh_lcache_fastmem();
 
         self.vi = r.pod()?;
         self.pe = r.pod()?;
@@ -308,6 +315,10 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
             self.hollywood = r.pod()?;
         }
 
+        self.dsp.pending_exceptions = if version >= 2 { r.u8()? } else { 0 };
+        self.gx.zfreeze_plane = if version >= 3 { r.pod()? } else { Default::default() };
+        self.gx.load_tmem_tail(&mut r, version >= 4)?;
+
         if r.remaining() != 0 {
             return Err(StateError::Corrupt("trailing data"));
         }
@@ -321,8 +332,9 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
         #[cfg(not(feature = "jit"))]
         self.mmio.clear_code_refcount();
 
-        self.render_sink.exec(crate::host::GxAction::InvalidateCaches);
+        self.render_sink.exec(crate::host::GxAction::InvalidateStateCaches);
         self.render_sink.reset_efb();
+        self.audio_sink.set_sample_rate(self.ai.control.aid_sample_rate_hz());
 
         Ok(())
     }

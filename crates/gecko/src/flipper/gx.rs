@@ -1,5 +1,7 @@
 mod bp;
 pub mod constants;
+pub mod depth;
+mod diagnostics;
 pub mod draw;
 pub mod fifo;
 #[cfg(feature = "jit")]
@@ -10,6 +12,7 @@ pub mod regs;
 pub mod tev;
 mod texgen;
 pub mod texture;
+mod tmem;
 mod vertex;
 mod xf;
 
@@ -19,6 +22,7 @@ use crate::flipper::gx::regs::{
     AlphaCompare, BlendMode, ChanCtrl, TevAlphaEnv, TevColorEnv, TevRegisterH, TevRegisterL, ZMode,
 };
 use crate::host::{GxAction, LightData, TextureKey, XfbPart};
+use crate::mmio::RamView;
 use crate::system::{ExecutionMode, System, SystemId};
 use rustc_hash::FxHashMap;
 
@@ -28,6 +32,7 @@ pub struct GraphicsProcessor {
     pub pending_token: u16,
     pub token_dirty: bool,
     pub projection: Matrix4,
+    pub zfreeze_plane: depth::DepthPlane,
     pub bp_regs: Vec<u32>,
     pub bp_mask: u32,
     pub cp_regs: Vec<u32>,
@@ -36,6 +41,8 @@ pub struct GraphicsProcessor {
     pub dl_scratch: Vec<u8>,
     draw_batch_data: Vec<u8>,
     draw_batch_entries: Vec<vertex::DrawBatchEntry>,
+    skip_filter_data: Vec<u8>,
+    skip_filter_entries: Vec<vertex::DrawBatchEntry>,
     draw_segments_scratch: Vec<crate::host::DrawSegment>,
     pub(crate) pending_efb_writeback_ranges: Vec<(u32, usize)>,
 
@@ -53,10 +60,10 @@ pub struct GraphicsProcessor {
     // Per-texture-slot TLUT binding (tmem offset + palette pixel format),
     // populated by BP_TX_SETTLUT writes.
     pub cur_tluts: [draw::TlutRef; 8],
-    // Palette TMEM: backing store for indexed texture palettes. Addressed as
-    // u16 entries; a LOADTLUT copies count*16 entries starting at
-    // (tmem_offset * 256). Fixed-size so indexing is branch-free.
-    pub palette_mem: Vec<u16>,
+    // Shared 1 MiB TMEM for palettes and manually preloaded textures.
+    // Entries hold guest big-endian u16s decoded to native order.
+    pub tmem: Vec<u16>,
+    pub(crate) tmem_generation: u64,
     pub cur_tev_color_env: [TevColorEnv; 16],
     pub cur_tev_alpha_env: [TevAlphaEnv; 16],
     pub cur_tev_color_regs_lo: [TevRegisterL; 4],
@@ -122,7 +129,7 @@ pub struct GraphicsProcessor {
     pub cached_lights: [LightData; 8],
     #[cfg(feature = "gx-stats")]
     pub(crate) stats: GxStats,
-    pub texture_hashes: FxHashMap<TextureKey, (u64, u64)>,
+    pub texture_hashes: FxHashMap<TextureKey, texture::TextureHash>,
     pub execution_mode: ExecutionMode,
 }
 
@@ -131,11 +138,32 @@ pub struct GraphicsProcessor {
 /// like Dolphin. `seen_present_seq` ages out dead regions. As seen in
 /// Another Code: R or whatever it's called, it builds each frame from a
 /// 230+228 line copy pair and showed a black seam plus a lagging bottom half.
+#[derive(Clone, Copy, Default)]
 pub struct XfbRegion {
     pub stride: u32,
     pub first_seq: u64,
     pub copy_seq: u64,
     pub seen_present_seq: u64,
+    pub ram_hash: Option<u64>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl XfbRegion {
+    pub fn ram_len(stride: u32, width: u32, height: u32) -> usize {
+        stride as usize * height.saturating_sub(1) as usize + width as usize * 2
+    }
+
+    pub fn hash_ram(ram: &RamView<'_>, base: u32, stride: u32, width: u32, height: u32) -> Option<u64> {
+        ram.slice(base as usize, Self::ram_len(stride, width, height))
+            .map(twox_hash::xxhash3_64::Hasher::oneshot)
+    }
+
+    pub fn cpu_written(&self, ram: &RamView<'_>, base: u32) -> bool {
+        self.ram_hash.is_some_and(|prev| {
+            Self::hash_ram(ram, base, self.stride, self.width, self.height).is_some_and(|now| now != prev)
+        })
+    }
 }
 
 // Drop regions that haven't been re-copied for a few frames so dead layouts
@@ -180,14 +208,18 @@ impl GraphicsProcessor {
             dl_scratch: Vec::with_capacity(4096),
             draw_batch_data: Vec::with_capacity(4096),
             draw_batch_entries: Vec::with_capacity(32),
+            skip_filter_data: Vec::new(),
+            skip_filter_entries: Vec::new(),
             draw_segments_scratch: Vec::with_capacity(32),
             pending_efb_writeback_ranges: Vec::new(),
             recorder: None,
             projection: Matrix4::default(),
+            zfreeze_plane: depth::DepthPlane::default(),
             cur_textures: Default::default(),
             tex_dirty: 0,
             cur_tluts: [draw::TlutRef::default(); 8],
-            palette_mem: vec![0u16; TLUT_MEM_ENTRIES],
+            tmem: vec![0u16; constants::TMEM_SIZE / 2],
+            tmem_generation: 0,
             cur_tev_color_env: Default::default(),
             cur_tev_alpha_env: Default::default(),
             cur_tev_color_regs_lo: Default::default(),
@@ -265,7 +297,7 @@ pub fn present_xfb<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
 
     if sys.gx.xfb_copy_seq == 0 {
         let base = sys.vi.latched_xfb_base;
-        self::present_raw_xfb(sys, base, frame_w, frame_h);
+        self::present_raw_xfb(sys, base, frame_w, frame_h, frame_w * 2, frame_w, frame_h);
         return;
     }
 
@@ -292,6 +324,21 @@ pub fn present_xfb<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     } else {
         vi_base
     };
+
+    if let Some(region) = sys.gx.xfb_regions.get(&frame_base).copied() {
+        if region.cpu_written(&sys.mmio.ram_view(), frame_base) {
+            self::present_raw_xfb(
+                sys,
+                frame_base,
+                frame_w,
+                frame_h,
+                region.stride,
+                region.width,
+                region.height,
+            );
+            return;
+        }
+    }
 
     // Measure the page-flip cadence. Emission is paced to it further down.
     if frame_base != sys.gx.xfb_last_seen_base {
@@ -485,29 +532,36 @@ pub fn present_xfb<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     sys.gx.xfb_last_present_base = frame_base;
 }
 
-fn present_raw_xfb<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, base: u32, width: u32, height: u32) {
+fn present_raw_xfb<const SYSTEM: SystemId>(
+    sys: &mut System<SYSTEM>,
+    base: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    source_width: u32,
+    source_height: u32,
+) {
     if base == 0 || width == 0 || height == 0 {
         return;
     }
 
-    let pixel_count = (width as usize) * (height as usize);
-    let mut pixels = vec![0u32; pixel_count];
+    let mut pixels = vec![0xff00_0000u32; width as usize * height as usize];
 
-    let to_bgra = |y: f32, cb: f32, cr: f32| -> u32 {
-        let r = (1.164 * y + 1.596 * cr).clamp(0.0, 255.0) as u32;
-        let g = (1.164 * y - 0.813 * cr - 0.391 * cb).clamp(0.0, 255.0) as u32;
-        let b = (1.164 * y + 2.018 * cb).clamp(0.0, 255.0) as u32;
-        0xFF00_0000 | (r << 16) | (g << 8) | b
-    };
+    let copy_w = width.min(source_width) & !1;
+    let copy_h = height.min(source_height);
+    let ram = sys.mmio.ram_view();
 
-    for i in 0..pixel_count / 2 {
-        let word = sys.mmio.phys_read_u32(base + (i as u32) * 4);
-        let y0 = ((word >> 24) & 0xFF) as f32 - 16.0;
-        let cb = ((word >> 16) & 0xFF) as f32 - 128.0;
-        let y1 = ((word >> 8) & 0xFF) as f32 - 16.0;
-        let cr = (word & 0xFF) as f32 - 128.0;
-        pixels[i * 2] = to_bgra(y0, cb, cr);
-        pixels[i * 2 + 1] = to_bgra(y1, cb, cr);
+    for y in 0..copy_h {
+        let Some(row) = ram.slice((base + y * stride) as usize, copy_w as usize * 2) else {
+            continue;
+        };
+
+        let out = &mut pixels[(y * width) as usize..][..copy_w as usize];
+        for (word, out) in row.chunks_exact(4).zip(out.chunks_exact_mut(2)) {
+            let [p0, p1] = crate::flipper::vi::yuyv_to_rgb(u32::from_be_bytes(word.try_into().unwrap()));
+            out[0] = 0xFF00_0000 | p0;
+            out[1] = 0xFF00_0000 | p1;
+        }
     }
 
     sys.render_sink.exec(GxAction::PresentRawXfb { width, height, pixels });
@@ -547,7 +601,8 @@ impl GraphicsProcessor {
         w.bytes(bytemuck::cast_slice(&self.bp_regs));
         w.bytes(bytemuck::cast_slice(&self.cp_regs));
         w.bytes(bytemuck::cast_slice(&self.xf_mem));
-        w.bytes(bytemuck::cast_slice(&self.palette_mem));
+        // Keep the original half-MiB layout; newer states append the rest.
+        w.bytes(bytemuck::cast_slice(&self.tmem[..TLUT_MEM_ENTRIES]));
         w.bytes(&self.fifo);
 
         w.pod(&self.cur_textures);
@@ -617,7 +672,7 @@ impl GraphicsProcessor {
         r.bytes_into(bytemuck::cast_slice_mut(&mut self.bp_regs))?;
         r.bytes_into(bytemuck::cast_slice_mut(&mut self.cp_regs))?;
         r.bytes_into(bytemuck::cast_slice_mut(&mut self.xf_mem))?;
-        r.bytes_into(bytemuck::cast_slice_mut(&mut self.palette_mem))?;
+        r.bytes_into(bytemuck::cast_slice_mut(&mut self.tmem[..TLUT_MEM_ENTRIES]))?;
 
         self.fifo.clear();
         self.fifo.extend_from_slice(r.bytes()?);
@@ -657,6 +712,7 @@ impl GraphicsProcessor {
                 first_seq: r.u64()?,
                 copy_seq: r.u64()?,
                 seen_present_seq: r.u64()?,
+                ..Default::default()
             };
             self.xfb_regions.insert(base, region);
         }
@@ -693,6 +749,8 @@ impl GraphicsProcessor {
         self.dl_scratch.clear();
         self.draw_batch_data.clear();
         self.draw_batch_entries.clear();
+        self.skip_filter_data.clear();
+        self.skip_filter_entries.clear();
         self.draw_segments_scratch.clear();
         self.texture_hashes.clear();
         #[cfg(feature = "jit")]

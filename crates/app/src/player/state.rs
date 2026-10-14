@@ -29,6 +29,7 @@ struct BootParams {
     memcard_path: Option<PathBuf>,
     execution_mode: gecko::ExecutionMode,
     input_config: hostinput::InputConfig,
+    texture_packs: bool,
 }
 
 struct Initialized {
@@ -47,7 +48,9 @@ pub struct PlayerState {
     aspect: TargetAspect,
     upscale: u32,
     input: Arc<Mutex<HostInput>>,
-    keymap: Keymap,
+    keymap: Mutex<Keymap>,
+    input_updates: hostinput::manager::InputUpdates,
+    wii_config: Mutex<(hostinput::config::WiiConfig, crate::keybinds::WiiKeysConfig)>,
     platform: Platform,
     boot_error: Option<String>,
     first_frame: Arc<AtomicBool>,
@@ -69,20 +72,24 @@ impl std::fmt::Debug for PlayerState {
 
 impl PlayerState {
     pub fn new(game: &Game, config: &Config) -> Arc<Self> {
-        let aspect = match game.platform {
-            Platform::Wii => TargetAspect::Ratio(16.0 / 9.0),
-            Platform::Gcn => TargetAspect::Ratio(4.0 / 3.0),
-        };
+        let aspect = config.aspect.target(game.platform);
         let neutral = match game.platform {
-            Platform::Wii => HostInput::wii_neutral(),
+            Platform::Wii => HostInput::wii_neutral().with_wii_options(
+                config.input.wii.nunchuk_attached.unwrap_or(true),
+                config.input.wii.sideways.unwrap_or(false),
+            ),
             Platform::Gcn => HostInput::gc_connected(),
         };
 
         let system_dir = config.system_dir_resolved();
         let dsp = Config::resolve_in_dir(&config.dsp_rom, &system_dir, DSP_ROM_FILE);
         let coef = Config::resolve_in_dir(&config.dsp_coef, &system_dir, DSP_COEF_FILE);
-        let ipl = Config::resolve_in_dir(&config.ipl, &system_dir, IPL_FILE);
-        let boot_error = self::validate(game.platform, game.format, &dsp, &coef, &ipl, &system_dir);
+        let ipl = if config.ipl_hle {
+            None
+        } else {
+            Config::resolve_in_dir(&config.ipl, &system_dir, IPL_FILE)
+        };
+        let boot_error = self::validate(game.platform, game.format, &ipl, config.ipl_hle, &system_dir);
 
         Arc::new(Self {
             boot: Mutex::new(Some(BootParams {
@@ -92,10 +99,11 @@ impl PlayerState {
                 coef_path: coef,
                 ipl_path: ipl,
                 skip_ipl: config.skip_ipl,
-                sram_path: config.sram_enabled.then(|| config::exe_relative(SRAM_FILE)),
-                memcard_path: config.memcard_enabled.then(|| config::exe_relative(MEMCARD_A_FILE)),
+                sram_path: config.sram_enabled.then(|| config::data_relative(SRAM_FILE)),
+                memcard_path: config.memcard_enabled.then(|| config::data_relative(MEMCARD_A_FILE)),
                 execution_mode: config.cpu_mode.into(),
                 input_config: config.input.clone(),
+                texture_packs: config.texture_packs,
             })),
             initialized: OnceLock::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -106,7 +114,9 @@ impl PlayerState {
             aspect,
             upscale: config.upscale,
             input: Arc::new(Mutex::new(neutral)),
-            keymap: config.keyboard.resolve(),
+            keymap: Mutex::new(config.keyboard.resolve()),
+            input_updates: Arc::new(Mutex::new(None)),
+            wii_config: Mutex::new((config.input.wii.clone(), config.keyboard.wii.clone())),
             platform: game.platform,
             boot_error,
             first_frame: Arc::new(AtomicBool::new(false)),
@@ -153,10 +163,32 @@ impl PlayerState {
             .expect("spawn player thread");
     }
 
+    pub fn refresh_wii_input(&self, config: &Config) {
+        if self.platform != Platform::Wii {
+            return;
+        }
+
+        let mut current = self.wii_config.lock().unwrap();
+        if current.0 == config.input.wii && current.1 == config.keyboard.wii {
+            return;
+        }
+
+        let mut input = self.input.lock().unwrap();
+        *input = input.cleared().with_wii_options(
+            config.input.wii.nunchuk_attached.unwrap_or(true),
+            config.input.wii.sideways.unwrap_or(false),
+        );
+
+        self.keymap.lock().unwrap().wii = config.keyboard.resolve().wii;
+        *self.input_updates.lock().unwrap() = Some(config.input.clone());
+        *current = (config.input.wii.clone(), config.keyboard.wii.clone());
+    }
+
     pub fn handle_keyboard(&self, key: Code, pressed: bool) {
         let mut input_guard = self.input.lock().unwrap();
+        let keymap = self.keymap.lock().unwrap();
         match &mut *input_guard {
-            HostInput::Gc(pad) => input::update_pad(pad, &self.keymap.gc, key, pressed),
+            HostInput::Gc(pad) => input::update_pad(pad, &keymap.gc, key, pressed),
             HostInput::Wii {
                 wiimote_buttons,
                 wiimote_shake,
@@ -165,13 +197,13 @@ impl PlayerState {
                 nunchuk_stick_y,
                 ..
             } => {
-                input::update_wiimote_keys(wiimote_buttons, &self.keymap.wii, key, pressed);
-                input::update_wiimote_motion_keys(wiimote_shake, &self.keymap.wii, key, pressed);
+                input::update_wiimote_keys(wiimote_buttons, &keymap.wii, key, pressed);
+                input::update_wiimote_motion_keys(wiimote_shake, &keymap.wii, key, pressed);
                 input::update_nunchuk_keys(
                     nunchuk_buttons,
                     nunchuk_stick_x,
                     nunchuk_stick_y,
-                    &self.keymap.wii,
+                    &keymap.wii,
                     key,
                     pressed,
                 );
@@ -179,8 +211,13 @@ impl PlayerState {
         }
     }
 
+    pub fn clear_input(&self) {
+        let mut input = self.input.lock().unwrap();
+        *input = input.cleared();
+    }
+
     pub fn hotkey(&self, key: Code) -> Option<Hotkey> {
-        self.keymap.hotkeys.lookup(key)
+        self.keymap.lock().unwrap().hotkeys.lookup(key)
     }
 
     pub fn handle_mouse_button(&self, button: MouseButton, pressed: bool) {
@@ -325,8 +362,14 @@ fn finish_boot<const S: gecko::system::SystemId>(
     mut emu: gecko::system::System<S>,
     game_id: String,
 ) {
+    if params.texture_packs {
+        sink.load_texture_pack(&gecko::paths::resolve("texturepacks"), &game_id);
+    }
     self::configure_emu(&mut emu, &params, sink, state.fps.clone());
-    emu.apply_host_input(&HostInput::neutral_for(S));
+    if S == system::WII {
+        emu.starlet.set_widescreen(state.aspect.is_widescreen());
+    }
+    emu.apply_host_input(&*state.input.lock().unwrap());
 
     let audio = self::install_audio_sink(&mut emu);
     let _ = emu.load_jit_cache(&game_id);
@@ -338,6 +381,7 @@ fn finish_boot<const S: gecko::system::SystemId>(
         emu,
         state.input.clone(),
         params.input_config,
+        state.input_updates.clone(),
         Some(game_id),
         state.throttle.clone(),
         state.paused.clone(),
@@ -410,38 +454,18 @@ fn set_initialized(state: &Arc<PlayerState>, renderer: Renderer, audio: Option<c
 fn validate(
     platform: Platform,
     format: Format,
-    dsp: &Option<PathBuf>,
-    coef: &Option<PathBuf>,
     ipl: &Option<PathBuf>,
+    ipl_hle: bool,
     system_dir: &Path,
 ) -> Option<String> {
-    let mut missing: Vec<&'static str> = Vec::new();
-    if dsp.is_none() {
-        missing.push(DSP_ROM_FILE);
-    }
-    if coef.is_none() {
-        missing.push(DSP_COEF_FILE);
-    }
-    if platform == Platform::Gcn && format != Format::Dol && ipl.is_none() {
-        missing.push(IPL_FILE);
-    }
-
-    if missing.is_empty() {
+    if platform != Platform::Gcn || format == Format::Dol || ipl_hle || ipl.is_some() {
         return None;
     }
 
-    let needed = if format == Format::Dol {
-        "DOL executables require dsp_rom.bin and dsp_coef.bin"
-    } else {
-        match platform {
-            Platform::Gcn => "GameCube games require IPL.bin, dsp_rom.bin and dsp_coef.bin",
-            Platform::Wii => "Wii games require dsp_rom.bin and dsp_coef.bin",
-        }
-    };
-
     Some(format!(
-        "{needed}.\n\nMissing: {}\n\nPlace them under {} or set explicit paths in config.toml.",
-        missing.join(", "),
+        "GameCube games require {IPL_FILE}. Enable Settings > Boot > IPL HLE (GameCube) to boot without it.
+
+Place it under {} or set an explicit path in config.toml.",
         system_dir.display(),
     ))
 }

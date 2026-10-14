@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use backend_wgpu::sink::TargetAspect;
 use iced::widget::image::Handle;
-use image::Dvd;
+use image::dvd::Header;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +129,26 @@ impl From<CpuMode> for gecko::ExecutionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AspectMode {
+    #[default]
+    Auto,
+    Standard,
+    Widescreen,
+    Stretch,
+}
+
+impl AspectMode {
+    pub fn target(self, platform: Platform) -> TargetAspect {
+        match (self, platform) {
+            (AspectMode::Auto, Platform::Wii) | (AspectMode::Widescreen, _) => TargetAspect::Ratio(16.0 / 9.0),
+            (AspectMode::Auto, Platform::Gcn) | (AspectMode::Standard, _) => TargetAspect::Ratio(4.0 / 3.0),
+            (AspectMode::Stretch, _) => TargetAspect::Stretch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreference {
     #[default]
@@ -159,8 +180,7 @@ pub struct Game {
 }
 
 impl Game {
-    pub fn from_dvd(path: &Path, dvd: &dyn Dvd, format: Format) -> Self {
-        let hdr = dvd.header();
+    pub fn from_metadata(path: &Path, hdr: &Header, banner: Option<image::banner::Banner>, format: Format) -> Self {
         let title = self::decode_cstring(&hdr.game_name);
         let game_id = String::from_utf8_lossy(&hdr.game_code).into_owned();
         let maker_code = String::from_utf8_lossy(&hdr.maker_code).into_owned();
@@ -168,7 +188,7 @@ impl Game {
 
         let region = Region::from_game_code(hdr.game_code);
         let platform = if hdr.is_wii() { Platform::Wii } else { Platform::Gcn };
-        let banner = image::banner::extract(dvd).map(BannerData::from).map(Arc::new);
+        let banner = banner.map(BannerData::from).map(Arc::new);
 
         let title_lc = title.to_lowercase();
         let file_name_lc = file_name.to_lowercase();

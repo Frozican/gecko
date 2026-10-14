@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub const IOCTL_GET_STATS: u32 = 0x2;
 pub const IOCTL_CREATE_DIR: u32 = 0x3;
 pub const IOCTL_READ_DIR: u32 = 0x4;
+pub const IOCTL_SET_ATTR: u32 = 0x5;
 pub const IOCTL_GET_ATTR: u32 = 0x6;
 pub const IOCTL_DELETE: u32 = 0x7;
 pub const IOCTL_RENAME: u32 = 0x8;
@@ -17,7 +18,7 @@ const FS_EINVAL: i32 = -101;
 const FS_EEXIST: i32 = -105;
 pub const FS_ENOENT: i32 = -106;
 const FS_MAX_PATH: usize = 0x40;
-const FS_DIRENT_NAME_LEN: usize = 0x13;
+const FS_DIRENT_NAME_LEN: usize = 13;
 const FS_CREATE_INPUT_LEN: usize = 0x4A;
 const FS_RENAME_INPUT_LEN: usize = FS_MAX_PATH * 2;
 const FS_ATTR_OWNER_ID_OFFSET: u32 = 0x00;
@@ -61,6 +62,7 @@ impl IosDevice for FileSystem {
         match cmd {
             IOCTL_GET_STATS => self.get_stats(ctx, out_ptr, out_len),
             IOCTL_CREATE_DIR => self.create_dir(ctx, in_ptr, in_len),
+            IOCTL_SET_ATTR => self.set_attr(ctx, in_ptr, in_len),
             IOCTL_GET_ATTR => self.get_attr(ctx, in_ptr, in_len, out_ptr, out_len),
             IOCTL_DELETE => self.delete(ctx, in_ptr, in_len),
             IOCTL_RENAME => self.rename(ctx, in_ptr, in_len),
@@ -96,6 +98,35 @@ impl IosDevice for FileSystem {
 }
 
 impl FileSystem {
+    fn set_attr(&self, ctx: &mut DeviceContext<'_>, in_ptr: u32, in_len: u32) -> i32 {
+        if (in_len as usize) < FS_CREATE_INPUT_LEN {
+            return FS_EINVAL;
+        }
+
+        let Some(path) = self::read_guest_path(ctx, in_ptr + FS_ATTR_PATH_OFFSET, FS_MAX_PATH) else {
+            return FS_EINVAL;
+        };
+
+        for offset in [
+            FS_ATTR_OWNER_PERM_OFFSET,
+            FS_ATTR_GROUP_PERM_OFFSET,
+            FS_ATTR_OTHER_PERM_OFFSET,
+        ] {
+            if ctx.mmio.phys_read_u8(in_ptr + offset) > 3 {
+                return FS_EINVAL;
+            }
+        }
+
+        let host_path = host::nand_to_host(&self.host_root, &path);
+        if !host_path.exists() {
+            return FS_ENOENT;
+        }
+
+        tracing::debug!(%path, "FS_SetAttr");
+
+        0
+    }
+
     fn read_dir(&self, ctx: &mut DeviceContext<'_>, in_count: u32, io_count: u32, vec_ptr: u32) -> i32 {
         let with_names = match (in_count, io_count) {
             (1, 1) => false,
@@ -106,11 +137,11 @@ impl FileSystem {
             }
         };
 
-        let path_ptr = self::vec_data(ctx, vec_ptr, 0);
-        let path_len = self::vec_len(ctx, vec_ptr, 0) as usize;
+        let path_ptr = super::vec_data(ctx.mmio, vec_ptr, 0);
+        let path_len = super::vec_len(ctx.mmio, vec_ptr, 0) as usize;
         let count_idx = if with_names { 3 } else { 1 };
-        let count_ptr = self::vec_data(ctx, vec_ptr, count_idx);
-        let count_len = self::vec_len(ctx, vec_ptr, count_idx);
+        let count_ptr = super::vec_data(ctx.mmio, vec_ptr, count_idx);
+        let count_len = super::vec_len(ctx.mmio, vec_ptr, count_idx);
 
         if path_len < FS_MAX_PATH || count_len < 4 {
             tracing::warn!(path_len, count_len, "FS_ReadDir: invalid vector sizes");
@@ -172,10 +203,10 @@ impl FileSystem {
             return 0;
         }
 
-        let max_count_ptr = self::vec_data(ctx, vec_ptr, 1);
-        let max_count_len = self::vec_len(ctx, vec_ptr, 1);
-        let names_ptr = self::vec_data(ctx, vec_ptr, 2);
-        let names_len = self::vec_len(ctx, vec_ptr, 2);
+        let max_count_ptr = super::vec_data(ctx.mmio, vec_ptr, 1);
+        let max_count_len = super::vec_len(ctx.mmio, vec_ptr, 1);
+        let names_ptr = super::vec_data(ctx.mmio, vec_ptr, 2);
+        let names_len = super::vec_len(ctx.mmio, vec_ptr, 2);
 
         if max_count_len < 4 {
             tracing::warn!(max_count_len, "FS_ReadDir: invalid max count vector size");
@@ -279,12 +310,12 @@ impl FileSystem {
             return FS_EINVAL;
         }
 
-        let path_ptr = self::vec_data(ctx, vec_ptr, 0);
-        let path_len = self::vec_len(ctx, vec_ptr, 0) as usize;
-        let used_clusters_ptr = self::vec_data(ctx, vec_ptr, 1);
-        let used_clusters_len = self::vec_len(ctx, vec_ptr, 1);
-        let used_inodes_ptr = self::vec_data(ctx, vec_ptr, 2);
-        let used_inodes_len = self::vec_len(ctx, vec_ptr, 2);
+        let path_ptr = super::vec_data(ctx.mmio, vec_ptr, 0);
+        let path_len = super::vec_len(ctx.mmio, vec_ptr, 0) as usize;
+        let used_clusters_ptr = super::vec_data(ctx.mmio, vec_ptr, 1);
+        let used_clusters_len = super::vec_len(ctx.mmio, vec_ptr, 1);
+        let used_inodes_ptr = super::vec_data(ctx.mmio, vec_ptr, 2);
+        let used_inodes_len = super::vec_len(ctx.mmio, vec_ptr, 2);
 
         if path_len < FS_MAX_PATH || used_clusters_len < 4 || used_inodes_len < 4 {
             tracing::warn!(
@@ -540,10 +571,12 @@ fn read_dir_names(path: &Path) -> std::io::Result<Vec<String>> {
 fn write_dir_names(out: &mut [u8], entries: &[String]) {
     out.fill(0);
 
-    for (slot, name) in out.chunks_exact_mut(FS_DIRENT_NAME_LEN).zip(entries) {
+    let mut offset = 0;
+    for name in entries {
         let bytes = name.as_bytes();
         let len = bytes.len().min(FS_DIRENT_NAME_LEN - 1);
-        slot[..len].copy_from_slice(&bytes[..len]);
+        out[offset..offset + len].copy_from_slice(&bytes[..len]);
+        offset += len + 1;
     }
 }
 
@@ -637,14 +670,4 @@ fn read_guest_path(ctx: &DeviceContext<'_>, ptr: u32, len: usize) -> Option<Stri
     let bytes = ctx.mmio.phys_slice(ptr, len);
     let end = bytes.iter().position(|&b| b == 0)?;
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
-}
-
-#[inline(always)]
-fn vec_data(ctx: &DeviceContext<'_>, vec_ptr: u32, idx: u32) -> u32 {
-    ctx.mmio.phys_read_u32(vec_ptr + idx * 8)
-}
-
-#[inline(always)]
-fn vec_len(ctx: &DeviceContext<'_>, vec_ptr: u32, idx: u32) -> u32 {
-    ctx.mmio.phys_read_u32(vec_ptr + idx * 8 + 4)
 }
