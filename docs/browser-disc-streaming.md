@@ -183,3 +183,17 @@ split into testable layers:
 
 No frontend or emulator runtime code has been changed by this audit. In
 particular, no Wii boot or game-play success is claimed.
+
+
+## First browser I/O primitive (2026-10-17)
+
+Added `crates/web/src/disc_stream.rs` with a browser `FileRangeReader`:
+
+- uses asynchronous `File.slice(...).array_buffer()` reads, so it does not block the JS event loop or require SharedArrayBuffer;
+- reads in 256 KiB chunks and maintains a 16-chunk LRU cache (4 MiB maximum cached payload);
+- validates overflow and end-of-file bounds and returns explicit JavaScript errors for invalid/incomplete reads;
+- keeps the selected browser `File` on the web side and does not copy the entire ISO into WASM memory.
+
+The web crate now declares `js-sys` and includes the module. This is intentionally only the I/O primitive: it is not yet called by the frontend, does not implement `image::Dvd`, and cannot boot a Wii game by itself. The boot/apploader and runtime DI state machines described above remain required.
+
+**Validation status:** source was committed to `feat/browser-disc-streaming`, but a Rust/WASM build and device test have not yet been run. The public Pages workflow remains unchanged.
