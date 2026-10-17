@@ -210,10 +210,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     }
 
     /// Finish a host-serviced read, copy it into emulated RAM, and schedule DI completion.
-    pub fn complete_async_dvd_read(
-        &mut self,
-        response: DiscReadResponse,
-    ) -> Result<(), String> {
+    pub fn complete_async_dvd_read(&mut self, response: DiscReadResponse) -> Result<(), String> {
         let request = self
             .di
             .async_port
@@ -224,9 +221,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
             Ok(bytes) => {
                 let destination = request.destination;
                 let length = request.length;
-                self.mmio
-                    .phys_slice_mut(destination, length)
-                    .copy_from_slice(&bytes);
+                self.mmio.phys_slice_mut(destination, length).copy_from_slice(&bytes);
                 #[cfg(feature = "jit")]
                 self.mmio.queue_icbi_for_range(destination, length as u32);
                 self.scheduler.schedule_in(
