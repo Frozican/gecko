@@ -113,3 +113,42 @@ impl FileRangeReader {
         Ok(output)
     }
 }
+
+/// JavaScript-facing handle for testing and future frontend integration.
+///
+/// This deliberately exposes only bounded range reads, not the full file as a
+/// byte array. `read_range` resolves asynchronously to a Uint8Array.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub struct BrowserDiscReader {
+    inner: FileRangeReader,
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+impl BrowserDiscReader {
+    #[wasm_bindgen::prelude::wasm_bindgen(constructor)]
+    pub fn new(file: File) -> BrowserDiscReader {
+        BrowserDiscReader {
+            inner: FileRangeReader::new(file),
+        }
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen(getter)]
+    pub fn size(&self) -> f64 {
+        self.inner.len() as f64
+    }
+
+    pub async fn read_range(
+        &self,
+        offset: f64,
+        length: u32,
+    ) -> Result<js_sys::Uint8Array, JsValue> {
+        if !offset.is_finite() || offset < 0.0 || offset.fract() != 0.0 {
+            return Err(JsValue::from_str("disc offset must be a non-negative integer"));
+        }
+        if offset > u64::MAX as f64 {
+            return Err(JsValue::from_str("disc offset is too large"));
+        }
+        let bytes = self.inner.read_range(offset as u64, length as usize).await?;
+        Ok(js_sys::Uint8Array::from(bytes.as_slice()))
+    }
+}
