@@ -212,3 +212,19 @@ so the next validation can compare its bytes with direct `File.slice()`
 reads on the actual NKit file. It is still not connected to `image::Dvd`,
 the Wii boot path, or the public Pages frontend. The existing GameCube launch
 path remains unchanged.
+
+
+## Browser range-reader test harness (2026-10-17)
+
+Added `crates/web/browser-disc-reader-test.html`. After building the WASM
+package with `wasm-pack build crates/web --target web --out-dir pkg --out-name gecko_web --release`,
+serve the `crates/web` directory over HTTP and open the harness. Choose the
+NKit image and run the tests. The harness compares start, middle, end, and
+chunk-boundary reads against the browser's direct `File.slice()` results,
+including a repeated boundary read to exercise the cache.
+
+The GitHub Actions WASM build and formatting check passed for the exported
+reader API (run:
+https://github.com/Frozican/gecko/actions/runs/39042621354). The harness has
+been added but has **not yet been executed in a real browser**. This is not a
+Wii boot test and does not change the public Pages website.
