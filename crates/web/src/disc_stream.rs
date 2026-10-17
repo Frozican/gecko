@@ -13,6 +13,9 @@ use web_sys::File;
 
 const CHUNK_SIZE: usize = 256 * 1024;
 const MAX_CACHED_CHUNKS: usize = 16;
+// Prevent a JavaScript caller from requesting a multi-gigabyte allocation in one read.
+// Streaming consumers should request bounded chunks and await each read.
+const MAX_READ_LENGTH: usize = 16 * 1024 * 1024;
 const MAX_NKIT_PARTITIONS: u32 = 10_000;
 const MAX_FST_SIZE: usize = 64 * 1024 * 1024;
 
@@ -77,6 +80,9 @@ impl FileRangeReader {
     }
 
     pub(crate) async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, JsValue> {
+        if length > MAX_READ_LENGTH {
+            return Err(JsValue::from_str("disc read exceeds the 16 MiB per-request limit"));
+        }
         let end = offset.checked_add(length as u64)
             .ok_or_else(|| JsValue::from_str("disc range overflow"))?;
         if end > self.len() {
@@ -160,6 +166,9 @@ impl BrowserDiscReader {
         offset: f64,
         length: u32,
     ) -> Result<js_sys::Uint8Array, JsValue> {
+        if length as usize > MAX_READ_LENGTH {
+            return Err(JsValue::from_str("disc read exceeds the 16 MiB per-request limit"));
+        }
         if !offset.is_finite() || offset < 0.0 || offset.fract() != 0.0 {
             return Err(JsValue::from_str("disc offset must be a non-negative integer"));
         }
