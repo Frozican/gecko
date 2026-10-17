@@ -240,3 +240,20 @@ The browser harness has a separate **Probe NKit metadata** button, independent o
 ## Device range-reader result
 
 A device run on the target 3,392,176,128-byte `Super Mario Galaxy (USA) (En,Fr,Es).nkit.iso` passed all five range checks: start, middle, end, cross-chunk boundary, and repeat cached boundary. The returned bytes matched `File.slice()`. This confirms the bounded browser range primitive on that device only; NKit metadata parsing and Wii game boot are separate tests.
+
+
+## Hosted NKit metadata probe on-device result (2026-10-17)
+
+After the latest GitHub Pages deployment, the Android Chrome test completed both diagnostics successfully on the selected Super Mario Galaxy NKit ISO:
+
+- Bounded Rust/WASM range checks: 5/5 passed against direct `File.slice()` reads.
+- NKit metadata probe: PASS; Disc ID `RMGE01`.
+- Partition offset: `0x58000`; reported partition data start: `0x78000`.
+- FST offset (partition-relative): `0x63BC00`; FST size: 81,308 bytes.
+- FST entries: 2,447; leaf file entries scanned: 2,371.
+- Sample names containing `strm` included `SMG_astrodome02_strm.ast`, `SMG_astroout01_strm.ast`, and `SMG_boss01a_strm.ast`.
+- Cached repeat of the 64-byte boundary read took 0.3 ms in this run, compared with 54.5 ms on the initial boundary read.
+
+This confirms that the deployed WASM reader and the current metadata/FST probe work on the target file in Android Chrome. It still does not establish generic NKit gap/hash restoration, Wii partition decryption, correct apploader loading, or game boot.
+
+The probe now also checks the absolute FST offset and end range for integer overflow and verifies that the complete FST range lies within the selected file before reading it.
