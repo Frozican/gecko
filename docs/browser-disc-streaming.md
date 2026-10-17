@@ -228,3 +228,10 @@ reader API (run:
 https://github.com/Frozican/gecko/actions/runs/39042621354). The harness has
 been added but has **not yet been executed in a real browser**. This is not a
 Wii boot test and does not change the public Pages website.
+
+
+## Bounded NKit metadata probe (2026-10-17)
+
+The Rust/WASM `BrowserDiscReader` now exposes an asynchronous `probe_nkit()` diagnostic. It reads bounded metadata ranges to check the `NKIT` marker, find the type-0 data partition, inspect the Wii boot-header game ID, read the FST, and report the number of leaf entries plus a small sample of filenames containing `strm`. The probe rejects implausible partition counts and oversized FSTs rather than allocating an unbounded buffer.
+
+The browser harness has a separate **Probe NKit metadata** button, independent of the direct range-equivalence tests. The result is only a metadata sanity check: it does not restore NKit gaps, decrypt/verify every partition sector, validate all file payloads, or boot a game. A successful WASM build and an on-device probe result are still required before claiming this diagnostic works on the target file.
