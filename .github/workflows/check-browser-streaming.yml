@@ -49,5 +49,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Run browser disc cache tests
+        run: cargo test --manifest-path crates/web/Cargo.toml --lib disc_stream::tests
+
       - name: Build web WASM
         run: wasm-pack build crates/web --target web --out-dir pkg --out-name gecko_web --release
