@@ -31,6 +31,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+      - name: Initialize required submodules
+        run: |
+          git submodule update --init --depth 1 --recursive submodules/chipi-spec
+          git submodule update --init --depth 1 --recursive submodules/solstice
+          git submodule update --init --depth 1 submodules/dolphin
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
