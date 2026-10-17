@@ -15,11 +15,11 @@
 </head>
 <body>
   <h1>Browser disc-reader test</h1>
-  <p class="note">Development harness for Gecko's WASM range reader. It reads only requested ranges, never the complete disc image. Use the hosted page on GitHub Pages, or build the web package and serve this file over HTTP from <code>crates/web</code>. The NKit probe checks metadata only; it does not decode the complete image or boot a game.</p>
+  <p class="note">Development harness for Gecko's WASM range reader. It reads only requested ranges, never the complete disc image. Use the hosted page on GitHub Pages, or build the web package and serve this file over HTTP from <code>crates/web</code>. The probe checks NKit metadata and boot-critical range boundaries only; it does not restore NKit gaps or boot a game.</p>
   <label>Disc image file: <input id="file" type="file"></label>
   <div>
     <button id="run" disabled>Run bounded range tests</button>
-    <button id="probe" disabled>Probe NKit metadata</button>
+    <button id="probe" disabled>Probe boot-critical ranges</button>
     <button id="clear">Clear output</button>
   </div>
   <pre id="output" aria-live="polite">Choose a disc image to begin.</pre>
@@ -54,7 +54,7 @@
       try {
         const file = fileInput.files[0];
         const reader = new BrowserDiscReader(file);
-        log("\nStarting bounded NKit metadata probe...");
+        log("\nStarting bounded NKit, apploader, main-DOL, and FST range probe...");
         log(await reader.probe_nkit());
       } catch (error) {
         log("\nNKit probe failed: " + (error?.stack || error));
