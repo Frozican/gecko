@@ -71,3 +71,21 @@ Inspect and reuse Gecko's existing RVZ partition-reading logic as a reference fo
 Next, establish the exact NKit ISO layout and whether the file can be read using an existing NKit-aware implementation or must first be normalized to a supported format. Validate a decrypted partition header, apploader, and FST before changing the synchronous `Dvd` abstraction. Do not switch the public Pages build to an experimental branch until a game boot succeeds on-device.
 
 This remains a design and diagnostic checkpoint; streaming and game boot are not implemented.
+
+
+## Multi-file NKit range probe (2026-10-17)
+
+A follow-up browser test on the same Super Mario Galaxy NKit ISO scanned the FST and sampled the beginning, middle, and end of seven known audio-stream files.
+
+Observed:
+- 21 of 21 requested 16-byte ranges returned the expected byte count.
+- No target files were missing.
+- Total sampled payload was 336 bytes, in addition to small disc/FST metadata reads.
+- Sampled file starts included plausible `STRM` headers.
+- The test used `File.slice()` ranges and did not copy whole files or the complete ISO.
+
+This increases confidence in the tested FST offset arithmetic and these specific file-to-ISO mappings. It does **not** validate all file ranges, NKit gap/repair semantics, every partition structure, or bootability.
+
+## Next implementation gate
+
+The browser-side range primitive and several NKit file mappings have now been demonstrated. The blocker is no longer whether Chrome can read selected bytes; it is how to provide correct synchronous reads to Gecko without retaining the whole ISO. Before changing the core reader, inspect the complete boot path and decide whether a worker plus bounded synchronous cache can be supported with the available browser APIs. The target Android browser has no SharedArrayBuffer/cross-origin isolation, so do not assume a shared-memory worker bridge is available. Keep the public Pages build unchanged until the prototype can validate metadata, apploader, FST, and reach a rendered game frame.
