@@ -185,6 +185,12 @@ impl BrowserDiscReader {
         let boot = self.inner.read_range(data_start, 0x440).await?;
         let game_id = std::str::from_utf8(&boot[0..6])
             .map_err(|_| JsValue::from_str("Wii boot header has invalid game ID"))?;
+        if !game_id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(JsValue::from_str("Wii boot header game ID contains invalid characters"));
+        }
+        if boot.get(0x18..0x1c) != Some(&[0x5D, 0x1C, 0x9E, 0xA3][..]) {
+            return Err(JsValue::from_str("Wii magic does not match at boot-header offset 0x18"));
+        }
         let fst_offset = (be_u32(&boot, 0x424)? as u64) * 4;
         let fst_size = (be_u32(&boot, 0x428)? as usize).checked_mul(4)
             .ok_or_else(|| JsValue::from_str("FST size overflow"))?;
