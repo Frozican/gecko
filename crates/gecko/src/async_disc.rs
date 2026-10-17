@@ -89,10 +89,7 @@ impl AsyncDiscPort {
             }
         };
         if id != expected.id {
-            return Err(format!(
-                "stale disc read response: expected {}, got {id}",
-                expected.id
-            ));
+            return Err(format!("stale disc read response: expected {}, got {id}", expected.id));
         }
         if bytes.len() != expected.length {
             self.pending = None;
