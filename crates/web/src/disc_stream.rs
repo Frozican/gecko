@@ -197,7 +197,14 @@ impl BrowserDiscReader {
         if fst_size < 12 || fst_size > MAX_FST_SIZE {
             return Err(JsValue::from_str("FST size is outside the diagnostic probe limit"));
         }
-        let fst = self.inner.read_range(data_start + fst_offset, fst_size).await?;
+        let fst_absolute_offset = data_start.checked_add(fst_offset)
+            .ok_or_else(|| JsValue::from_str("absolute FST offset overflow"))?;
+        let fst_end = fst_absolute_offset.checked_add(fst_size as u64)
+            .ok_or_else(|| JsValue::from_str("FST range overflow"))?;
+        if fst_end > self.inner.len() {
+            return Err(JsValue::from_str("FST range extends beyond end of disc image"));
+        }
+        let fst = self.inner.read_range(fst_absolute_offset, fst_size).await?;
         let entry_count = be_u32(&fst, 8)? as usize;
         let string_table_offset = entry_count.checked_mul(12)
             .ok_or_else(|| JsValue::from_str("FST entry count overflow"))?;
