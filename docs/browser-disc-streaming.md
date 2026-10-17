@@ -37,3 +37,22 @@ The next implementation decision must account for both execution and rendering:
 ## Status
 
 This commit documents the first source-level investigation and the architecture gate. It does not claim that streaming or Wii game boot is implemented. The web front end and deployment workflow should not switch to this branch until a working prototype passes the criteria above.
+
+## On-device NKit ISO findings (2026-10-17)
+
+The browser-only range test was run on the target 3,392,176,128-byte Super Mario Galaxy NKit ISO in Android Chrome. It read the disc header and partition metadata without uploading or copying the complete file.
+
+Observed values:
+- Wii magic at disc-header offset 0x18 is recognized.
+- Header FST offset/size are zero, so the GameCube-style header FST path is not applicable.
+- Partition group 0 has one entry; partition table at 0x40020 points to a type-0 partition at 0x58000.
+- Partition metadata reports the data-area offset 0x20000 relative to the partition, giving absolute file offset 0x78000.
+- The reported data-area length is 3,391,684,608 bytes, ending exactly at the selected file's size.
+- The first bytes at 0x78000 include the disc header / game ID (RMGE01), consistent with the beginning of a Wii data-partition sector; this is not proof that later payload bytes are plaintext.
+- The test has only read metadata and a 64-byte prefix. It has not decrypted partition payload, located the decrypted FST, or booted the game.
+
+## Updated next technical gate
+
+Before integrating streaming into Dvd, implement and validate a small, isolated Wii-sector reader against this selected-file layout. Wii partition sectors are physically 0x8000 bytes, with 0x400 bytes of hash/metadata area and 0x7C00 bytes of user data per sector. The reader must map logical user-data offsets to physical sector offsets and correctly handle the encrypted payload and its required title-key/IV handling. It must also distinguish NKit-specific layout/repair behavior from a standard raw Wii ISO. Only after a test can read and validate the decrypted partition header/apploader and locate the FST should the core Dvd abstraction be changed.
+
+This is a more specific implementation gate than the original plan; it does not imply that the sector reader or game boot is implemented.
