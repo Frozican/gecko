@@ -22,6 +22,7 @@ egui-wgpu = "0.34.2"
 egui-winit = { version = "0.34.2", default-features = false, features = ["links"] }
 wasm-bindgen = "0.2.117"
 wasm-bindgen-futures = "0.4.67"
+js-sys = "0.3.94"
 web-sys = { version = "0.3.94", features = [
     "Document",
     "Window",
