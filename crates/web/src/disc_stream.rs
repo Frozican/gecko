@@ -231,6 +231,50 @@ impl BrowserDiscReader {
         if boot.get(0x18..0x1c) != Some(&[0x5D, 0x1C, 0x9E, 0xA3][..]) {
             return Err(JsValue::from_str("Wii magic does not match at boot-header offset 0x18"));
         }
+        // Probe the fixed apploader header and main DOL header too. This verifies
+        // that the browser can fetch the next boot-critical structures without
+        // loading the complete image; it does not execute them or restore NKit gaps.
+        let apploader_offset = data_start.checked_add(0x2440)
+            .ok_or_else(|| JsValue::from_str("apploader offset overflow"))?;
+        let apploader = self.inner.read_range(apploader_offset, 0x20).await?;
+        let apploader_date = String::from_utf8_lossy(&apploader[0..10]).trim_end_matches('\0').to_string();
+        let apploader_code_size = be_u32(&apploader, 0x14)? as u64;
+        let apploader_trailer_size = be_u32(&apploader, 0x18)? as u64;
+        let apploader_total = 0x20u64.checked_add(apploader_code_size)
+            .and_then(|n| n.checked_add(apploader_trailer_size))
+            .ok_or_else(|| JsValue::from_str("apploader size overflow"))?;
+        if apploader_total > 32 * 1024 * 1024 {
+            return Err(JsValue::from_str("apploader metadata exceeds diagnostic safety limit"));
+        }
+        let apploader_end = apploader_offset.checked_add(apploader_total)
+            .ok_or_else(|| JsValue::from_str("apploader range overflow"))?;
+        if apploader_end > self.inner.len() {
+            return Err(JsValue::from_str("apploader range extends beyond end of disc image"));
+        }
+
+        let dol_offset = (be_u32(&boot, 0x420)? as u64).checked_mul(4)
+            .ok_or_else(|| JsValue::from_str("DOL offset overflow"))?;
+        let dol_absolute_offset = data_start.checked_add(dol_offset)
+            .ok_or_else(|| JsValue::from_str("absolute DOL offset overflow"))?;
+        let dol_header = self.inner.read_range(dol_absolute_offset, 0x100).await?;
+        let mut dol_end = 0x100u64;
+        for section in 0..18usize {
+            let offset_field = if section < 7 { section * 4 } else { 0x1c + (section - 7) * 4 };
+            let size_field = if section < 7 { 0x90 + section * 4 } else { 0xac + (section - 7) * 4 };
+            let file_offset = be_u32(&dol_header, offset_field)? as u64;
+            let file_size = be_u32(&dol_header, size_field)? as u64;
+            if file_size == 0 { continue; }
+            let end = file_offset.checked_add(file_size)
+                .ok_or_else(|| JsValue::from_str("DOL section range overflow"))?;
+            if end > 256 * 1024 * 1024 {
+                return Err(JsValue::from_str("DOL section exceeds diagnostic safety limit"));
+            }
+            dol_end = dol_end.max(end);
+        }
+        if dol_absolute_offset.checked_add(dol_end).is_none_or(|end| end > self.inner.len()) {
+            return Err(JsValue::from_str("main DOL section ranges extend beyond end of disc image"));
+        }
+
         let fst_offset = (be_u32(&boot, 0x424)? as u64) * 4;
         let fst_size = (be_u32(&boot, 0x428)? as usize).checked_mul(4)
             .ok_or_else(|| JsValue::from_str("FST size overflow"))?;
@@ -272,7 +316,7 @@ impl BrowserDiscReader {
         }
 
         Ok(format!(
-            "NKit metadata probe: PASS\nDisc ID: {game_id}\nISO size: {} bytes\nPartition offset: 0x{partition_offset:X}\nPartition data start: 0x{data_start:X}\nFST offset (partition-relative): 0x{fst_offset:X}\nFST size: {fst_size} bytes\nFST entries: {entry_count}\nLeaf file entries scanned: {leaf_files}\nFilenames containing 'strm' (up to 8): {}\n\nDiagnostic only: this does not restore NKit gaps/hash data and does not boot the game.",
+            "NKit metadata probe: PASS\nDisc ID: {game_id}\nISO size: {} bytes\nPartition offset: 0x{partition_offset:X}\nPartition data start: 0x{data_start:X}\nApploader header: PASS (date: {apploader_date}, code: {apploader_code_size} bytes, trailer: {apploader_trailer_size} bytes, range in file)\nMain DOL header: PASS (relative offset: 0x{dol_offset:X}, declared sections end at +0x{dol_end:X})\nFST offset (partition-relative): 0x{fst_offset:X}\nFST size: {fst_size} bytes\nFST entries: {entry_count}\nLeaf file entries scanned: {leaf_files}\nFilenames containing 'strm' (up to 8): {}\n\nDiagnostic only: this confirms metadata/ranges can be read, but does not restore NKit gaps/hash data and does not boot the game.",
             self.inner.len(),
             if matching_stream_names.is_empty() { "(none in this scan)".to_string() } else { matching_stream_names.join(", ") }
         ))
