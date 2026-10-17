@@ -88,7 +88,7 @@ impl FileRangeReader {
     }
 
     pub(crate) async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, JsValue> {
-        validate_read_length(length).map_err(JsValue::from_str)?
+        validate_read_length(length).map_err(JsValue::from_str)?;
         let end = offset.checked_add(length as u64)
             .ok_or_else(|| JsValue::from_str("disc range overflow"))?;
         if end > self.len() {
