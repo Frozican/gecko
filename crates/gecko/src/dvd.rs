@@ -9,6 +9,14 @@ pub enum Command {
     AudioToggle(bool),
 }
 
+/// A disc DMA that must be fulfilled by an asynchronous host reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncDiscRead {
+    pub offset: usize,
+    pub destination: u32,
+    pub length: usize,
+}
+
 pub struct DvdInterface {
     pub status: regs::DiStatusRegister,
     pub cover: regs::DiCoverRegister,
@@ -21,6 +29,8 @@ pub struct DvdInterface {
     pub cmdbuf2: u32,
     pub immbuf: u32,
     pub dvd: Option<Box<dyn image::Dvd>>,
+    async_reads: bool,
+    pending_read: Option<AsyncDiscRead>,
 }
 
 impl DvdInterface {
@@ -37,6 +47,8 @@ impl DvdInterface {
             cmdbuf2: 0,
             immbuf: 0,
             dvd: None,
+            async_reads: false,
+            pending_read: None,
         }
     }
 
@@ -112,6 +124,28 @@ pub fn start_transfer<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
     };
 
     if let Some(cmd) = sys.di.resolve_command() {
+        if sys.di.async_reads {
+            let read = match cmd {
+                Command::ReadSectorData => Some(AsyncDiscRead {
+                    offset: (sys.di.cmdbuf1 << 2) as usize,
+                    destination: sys.di.dma_address.address(),
+                    length: sys.di.cmdbuf2 as usize,
+                }),
+                Command::ReadDiskId => Some(AsyncDiscRead {
+                    offset: 0,
+                    destination: sys.di.dma_address.address(),
+                    length: sys.di.dma_length.length() as usize,
+                }),
+                _ => None,
+            };
+            if let Some(read) = read {
+                assert_eq!(read.length, sys.di.dma_length.length() as usize, "DMA length mismatch");
+                sys.di.pending_read = Some(read);
+                sys.di.dvd = Some(dvd);
+                // The host completes the read and only then starts the DI delay/interrupt.
+                return;
+            }
+        }
         self::process_dvd_command(sys, cmd, &dvd);
     }
 
@@ -195,6 +229,38 @@ fn process_dvd_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd: Co
 }
 
 impl<const SYSTEM: SystemId> System<SYSTEM> {
+    /// Enable host-serviced disc reads. When enabled, DI DMA reads suspend emulation
+    /// until the browser has asynchronously fetched the requested byte range.
+    pub fn enable_async_disc_reads(&mut self) {
+        self.di.async_reads = true;
+    }
+
+    /// Return the outstanding disc read without clearing it. The host should issue
+    /// at most one fetch for this request and call complete_async_disc_read once.
+    pub fn pending_async_disc_read(&self) -> Option<AsyncDiscRead> {
+        self.di.pending_read
+    }
+
+    /// Complete the outstanding host read. The DI transfer interrupt is scheduled
+    /// only after the bytes have been copied into emulated RAM.
+    pub fn complete_async_disc_read(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        let request = self.di.pending_read.ok_or("no asynchronous disc read is pending")?;
+        if data.len() != request.length {
+            return Err("asynchronous disc read returned an unexpected byte count");
+        }
+        let buffer = self.mmio.phys_slice_mut(request.destination, request.length);
+        buffer.copy_from_slice(data);
+        #[cfg(feature = "jit")]
+        self.mmio.queue_icbi_for_range(request.destination, request.length as u32);
+        self.di.pending_read = None;
+        const DI_TRANSFER_DELAY_US: u64 = 20;
+        self.scheduler.schedule_in(
+            crate::scheduler::microseconds_to_cycles(SYSTEM, DI_TRANSFER_DELAY_US),
+            crate::scheduler::Handler::DiTransferDone,
+        );
+        Ok(())
+    }
+
     pub fn insert_dvd(&mut self, dvd: Box<dyn image::Dvd>) {
         let name = String::from_utf8_lossy(&dvd.header().game_name);
         let name = name.trim_end_matches('\0');
