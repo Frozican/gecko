@@ -54,10 +54,10 @@
       try {
         const file = fileInput.files[0];
         const reader = new BrowserDiscReader(file);
-        log("\\nStarting bounded NKit metadata probe...");
+        log("\nStarting bounded NKit metadata probe...");
         log(await reader.probe_nkit());
       } catch (error) {
-        log("\\nNKit probe failed: " + (error?.stack || error));
+        log("\nNKit probe failed: " + (error?.stack || error));
       } finally {
         probeButton.disabled = !wasmReady || !fileInput.files?.length;
       }
