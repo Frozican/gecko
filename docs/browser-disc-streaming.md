@@ -89,3 +89,19 @@ This increases confidence in the tested FST offset arithmetic and these specific
 ## Next implementation gate
 
 The browser-side range primitive and several NKit file mappings have now been demonstrated. The blocker is no longer whether Chrome can read selected bytes; it is how to provide correct synchronous reads to Gecko without retaining the whole ISO. Before changing the core reader, inspect the complete boot path and decide whether a worker plus bounded synchronous cache can be supported with the available browser APIs. The target Android browser has no SharedArrayBuffer/cross-origin isolation, so do not assume a shared-memory worker bridge is available. Keep the public Pages build unchanged until the prototype can validate metadata, apploader, FST, and reach a rendered game frame.
+
+
+## Bounded browser range-cache prototype (2026-10-17)
+
+The website repository now includes an experimental browser test at `nkit-bounded-cache-test.html` with worker `nkit-bounded-cache-worker.js`. It uses 256 KiB physical ISO chunks and a 4 MiB LRU payload cap, compares cached reads against direct `File.slice()` reads, and probes start/middle/end plus a physical chunk-boundary range for four known files. It reports hit/miss counts and peak cached payload.
+
+This prototype is deliberately only a JavaScript I/O experiment. It does not solve the key integration mismatch: Gecko's `Dvd::read_disc_into` and `read_raw_disc` are synchronous Rust methods, whereas browser File reads are asynchronous. Without SharedArrayBuffer/cross-origin isolation, a synchronous JS bridge that blocks waiting for async reads is not a viable assumption. The Android browser test also found worker WebGPU unavailable, so moving the existing WebGPU frontend wholly into a worker is not presently validated.
+
+## Core integration decision
+
+Do not wire the JS LRU cache into Gecko by pretending asynchronous reads are synchronous. A production solution requires one of these explicit architectural changes:
+
+1. **Resumable/asynchronous emulation:** propagate pending disc reads through the CPU/system scheduler and resume emulation after the browser read completes. This is a broad core refactor, but is compatible with the observed browser constraints.
+2. **Supported synchronous backing store:** first prove a browser API and storage arrangement that synchronously serves requested ranges without copying the full 3.39 GB image. The current Android test has not demonstrated such a backing store.
+
+The immediate next code investigation is to map every call site that consumes `Dvd::read_disc_into`/ `read_raw_disc` during boot and determine whether emulation can yield and resume around disc I/O. Until that is designed and tested, the range-cache prototype should remain a diagnostic tool, not be described as a working streaming emulator.
