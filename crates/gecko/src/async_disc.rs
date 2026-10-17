@@ -42,7 +42,10 @@ pub struct AsyncDiscPort {
 
 impl AsyncDiscPort {
     pub fn new() -> Self {
-        Self { next_id: 1, pending: None }
+        Self {
+            next_id: 1,
+            pending: None,
+        }
     }
 
     /// Start a read, failing if a previous read has not been completed.
@@ -76,18 +79,28 @@ impl AsyncDiscPort {
             DiscReadResponse::Data { id, bytes } => (id, bytes),
             DiscReadResponse::Error { id, message } => {
                 if id != expected.id {
-                    return Err(format!("stale disc read error response: expected {}, got {id}", expected.id));
+                    return Err(format!(
+                        "stale disc read error response: expected {}, got {id}",
+                        expected.id
+                    ));
                 }
                 self.pending = None;
                 return Err(message);
             }
         };
         if id != expected.id {
-            return Err(format!("stale disc read response: expected {}, got {id}", expected.id));
+            return Err(format!(
+                "stale disc read response: expected {}, got {id}",
+                expected.id
+            ));
         }
         if bytes.len() != expected.length {
             self.pending = None;
-            return Err(format!("disc read length mismatch: expected {}, got {}", expected.length, bytes.len()));
+            return Err(format!(
+                "disc read length mismatch: expected {}, got {}",
+                expected.length,
+                bytes.len()
+            ));
         }
         self.pending = None;
         Ok(bytes)
@@ -104,7 +117,11 @@ mod tests {
         let request = port.begin(0x1234, 4, 0x8000_1000).unwrap();
         assert_eq!(port.pending(), Some(request));
         assert_eq!(
-            port.complete(DiscReadResponse::Data { id: request.id, bytes: vec![1, 2, 3, 4] }).unwrap(),
+            port.complete(DiscReadResponse::Data {
+                id: request.id,
+                bytes: vec![1, 2, 3, 4]
+            })
+            .unwrap(),
             vec![1, 2, 3, 4]
         );
         assert_eq!(port.pending(), None);
@@ -121,7 +138,13 @@ mod tests {
     fn rejects_stale_responses_without_consuming_active_request() {
         let mut port = AsyncDiscPort::new();
         let request = port.begin(0, 2, 0x8000_0000).unwrap();
-        assert!(port.complete(DiscReadResponse::Data { id: request.id + 1, bytes: vec![1, 2] }).is_err());
+        assert!(
+            port.complete(DiscReadResponse::Data {
+                id: request.id + 1,
+                bytes: vec![1, 2]
+            })
+            .is_err()
+        );
         assert_eq!(port.pending(), Some(request));
     }
 
@@ -129,7 +152,13 @@ mod tests {
     fn rejects_short_reads_and_clears_request() {
         let mut port = AsyncDiscPort::new();
         let request = port.begin(0, 3, 0x8000_0000).unwrap();
-        assert!(port.complete(DiscReadResponse::Data { id: request.id, bytes: vec![1, 2] }).is_err());
+        assert!(
+            port.complete(DiscReadResponse::Data {
+                id: request.id,
+                bytes: vec![1, 2]
+            })
+            .is_err()
+        );
         assert_eq!(port.pending(), None);
     }
 }
