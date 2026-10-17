@@ -197,3 +197,18 @@ Added `crates/web/src/disc_stream.rs` with a browser `FileRangeReader`:
 The web crate now declares `js-sys` and includes the module. This is intentionally only the I/O primitive: it is not yet called by the frontend, does not implement `image::Dvd`, and cannot boot a Wii game by itself. The boot/apploader and runtime DI state machines described above remain required.
 
 **Validation status:** source was committed to `feat/browser-disc-streaming`, but a Rust/WASM build and device test have not yet been run. The public Pages workflow remains unchanged.
+
+
+## WASM-exposed range-reader API (2026-10-17)
+
+The browser crate now exports `BrowserDiscReader` to JavaScript. Construct it
+with a browser `File`, read its `size` property, and call
+`await reader.read_range(offset, length)` to receive only that range as a
+`Uint8Array`. The reader still uses 256 KiB chunks and a 4 MiB LRU cache and
+rejects invalid offsets, overflow, and reads beyond EOF.
+
+This makes the Rust/WASM range-reader itself callable from a browser harness,
+so the next validation can compare its bytes with direct `File.slice()`
+reads on the actual NKit file. It is still not connected to `image::Dvd`,
+the Wii boot path, or the public Pages frontend. The existing GameCube launch
+path remains unchanged.
