@@ -105,3 +105,23 @@ Do not wire the JS LRU cache into Gecko by pretending asynchronous reads are syn
 2. **Supported synchronous backing store:** first prove a browser API and storage arrangement that synchronously serves requested ranges without copying the full 3.39 GB image. The current Android test has not demonstrated such a backing store.
 
 The immediate next code investigation is to map every call site that consumes `Dvd::read_disc_into`/ `read_raw_disc` during boot and determine whether emulation can yield and resume around disc I/O. Until that is designed and tested, the range-cache prototype should remain a diagnostic tool, not be described as a working streaming emulator.
+
+
+## Bounded range-cache on-device result (2026-10-17)
+
+The Android Chrome test of `nkit-bounded-cache-test.html` completed successfully against the selected RMGE01 NKit ISO:
+
+- 16 cached-vs-direct range comparisons passed; 0 failed.
+- The test covered start, middle, end, and physical cache-chunk-crossing ranges in four audio-stream files.
+- Cache chunk size: 262,144 bytes (256 KiB); configured payload cap: 4,194,304 bytes (4 MiB).
+- Peak cached payload: 3,932,160 bytes, below the cap.
+- Cache counters: 5 hits and 15 misses.
+- The tested payload was fetched in bounded chunks; no whole-ISO copy was made.
+
+This confirms the JavaScript LRU cache's bounded behavior and sampled byte-for-byte equivalence for these tested ranges. It does not validate every logical file range, decode all NKit structures, connect the cache to Gecko, or demonstrate a game boot.
+
+## Immediate next step: trace the synchronous read call graph
+
+Before implementing a yield/resume design, map the concrete call sites and boot-time dependencies of `Dvd::read_disc_into` and `Dvd::read_raw_disc`, including apploader loading, FST/file access, DVD command handling, and any reads performed while the CPU/system scheduler is running. For each call site, record whether it can return a pending-read result without exposing partially filled buffers or violating device timing.
+
+Do not change the trait to async in isolation: this is a broad interface used by the core, and an async read must be propagated to the emulation scheduler and DVD command state machine. Keep the public Pages workflow unchanged until this path can be built and tested end-to-end.
