@@ -15,7 +15,7 @@
 </head>
 <body>
   <h1>Browser disc-reader test</h1>
-  <p class="note">Development harness for Gecko's WASM range reader. It reads only the requested ranges, never the complete disc image. Build the web package first and serve this page over HTTP from the <code>crates/web</code> directory.</p>
+  <p class="note">Development harness for Gecko's WASM range reader. It reads only requested ranges, never the complete disc image. Use the hosted page on GitHub Pages, or build the web package and serve this file over HTTP from <code>crates/web</code>. The NKit probe checks metadata only; it does not decode the complete image or boot a game.</p>
   <label>Disc image file: <input id="file" type="file"></label>
   <div>
     <button id="run" disabled>Run bounded range tests</button>
