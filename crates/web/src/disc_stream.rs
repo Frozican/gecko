@@ -88,7 +88,8 @@ impl FileRangeReader {
         while cursor < end {
             let chunk_index = cursor / CHUNK_SIZE as u64;
             let chunk_start = chunk_index * CHUNK_SIZE as u64;
-            let chunk = if let Some(bytes) = self.cache.borrow_mut().get(chunk_index) {
+            let cached = { self.cache.borrow_mut().get(chunk_index) };
+            let chunk = if let Some(bytes) = cached {
                 bytes
             } else {
                 let slice_end = (chunk_start + CHUNK_SIZE as u64).min(self.len());
