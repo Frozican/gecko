@@ -96,6 +96,27 @@
           log("  " + hex(bytes));
         }
         log("\nRESULT: " + passed + "/" + tests.length + " ranges matched File.slice().");
+
+        // Guardrail checks: malformed offsets and out-of-file ranges must reject,
+        // rather than wrap, truncate, or panic in WASM.
+        const invalidCases = [
+          ["negative offset", () => reader.read_range(-1, 1)],
+          ["fractional offset", () => reader.read_range(0.5, 1)],
+          ["range beyond EOF", () => reader.read_range(size, 1)]
+        ];
+        let rejected = 0;
+        for (const [name, run] of invalidCases) {
+          let didReject = false;
+          try {
+            await run();
+          } catch (_) {
+            didReject = true;
+          }
+          if (!didReject) throw new Error("invalid-range guard failed: " + name);
+          rejected++;
+          log("PASS rejects " + name);
+        }
+        log("GUARDRAILS: " + rejected + "/" + invalidCases.length + " invalid ranges rejected.");
         log("This tests the range-reader primitive only; it does not boot a Wii game.");
       } catch (error) {
         log("\nFAIL: " + (error?.stack || error));
