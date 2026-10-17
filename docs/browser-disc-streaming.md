@@ -48,11 +48,26 @@ Observed values:
 - Partition group 0 has one entry; partition table at 0x40020 points to a type-0 partition at 0x58000.
 - Partition metadata reports the data-area offset 0x20000 relative to the partition, giving absolute file offset 0x78000.
 - The reported data-area length is 3,391,684,608 bytes, ending exactly at the selected file's size.
-- The first bytes at 0x78000 include the disc header / game ID (RMGE01), consistent with the beginning of a Wii data-partition sector; this is not proof that later payload bytes are plaintext.
-- The test has only read metadata and a 64-byte prefix. It has not decrypted partition payload, located the decrypted FST, or booted the game.
+- The first bytes at 0x78000 include the disc header / game ID (RMGE01). This alone does not establish how the remainder of the NKit payload is laid out or whether it is plaintext.
+- The test has only read metadata and small ranges. It has not decrypted partition payload, located the decrypted FST, or booted the game.
+
+## Follow-up sector-mapping test (2026-10-17)
+
+A targeted browser Worker test tried the common Wii physical-sector mapping: each 0x8000-byte physical sector contributes 0x7C00 bytes of logical user data after skipping its first 0x400 bytes.
+
+Observed on the selected NKit file:
+- Raw bytes at 0x78000 begin with `RMGE01` and the Wii magic.
+- Applying the assumed mapping to logical offset 0 returns 32 zero bytes, not a plausible boot header.
+- The raw boot-header candidate at 0x78000 has FST fields `0x18EF00`, `0x4F67`, `0x4F67`; shifting these header values left by two gives `0x63BC00`, `0x13D9C`, `0x13D9C`.
+- Reading the candidate FST offset through the assumed mapping yields bytes whose root entry does not validate.
+- The test did not decrypt AES-encrypted partition data and did not validate NKit repair semantics.
+
+Conclusion: the simple 0x400-byte-skip mapping is **not validated for this NKit file** and must not be used as the production reader. The result does not prove that the image is invalid. It shows that NKit layout and/or partition decryption/sector interpretation must be resolved first.
 
 ## Updated next technical gate
 
-Before integrating streaming into Dvd, implement and validate a small, isolated Wii-sector reader against this selected-file layout. Wii partition sectors are physically 0x8000 bytes, with 0x400 bytes of hash/metadata area and 0x7C00 bytes of user data per sector. The reader must map logical user-data offsets to physical sector offsets and correctly handle the encrypted payload and its required title-key/IV handling. It must also distinguish NKit-specific layout/repair behavior from a standard raw Wii ISO. Only after a test can read and validate the decrypted partition header/apploader and locate the FST should the core Dvd abstraction be changed.
+Inspect and reuse Gecko's existing RVZ partition-reading logic as a reference for the required transformations. In `crates/image/src/rvz.rs`, Wii RVZ reading uses partition metadata to select chunks, strips per-chunk hash-exception metadata, unpacks stored data, and exposes decrypted logical user-data bytes through `read_partition_decrypted`. That path is specific to RVZ chunk structures and cannot simply be applied to an NKit ISO, but it is the best in-repository reference for the semantics that a streaming reader must preserve.
 
-This is a more specific implementation gate than the original plan; it does not imply that the sector reader or game boot is implemented.
+Next, establish the exact NKit ISO layout and whether the file can be read using an existing NKit-aware implementation or must first be normalized to a supported format. Validate a decrypted partition header, apploader, and FST before changing the synchronous `Dvd` abstraction. Do not switch the public Pages build to an experimental branch until a game boot succeeds on-device.
+
+This remains a design and diagnostic checkpoint; streaming and game boot are not implemented.
