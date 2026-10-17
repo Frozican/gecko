@@ -26,11 +26,20 @@ impl Cache {
         Self { chunks: HashMap::new(), lru: VecDeque::new() }
     }
 
-    fn get(&mut self, index: u64) -> Option<Vec<u8>> {
-        let bytes = self.chunks.get(&index)?.clone();
+    fn copy_range(&mut self, index: u64, start: usize, end: usize, output: &mut Vec<u8>) -> bool {
+        let Some(bytes) = self.chunks.get(&index) else {
+            return false;
+        };
+        if start > end || end > bytes.len() {
+            return false;
+        }
+
+        // Copy only the requested bytes. Cloning the full 256 KiB cache entry
+        // on every hit needlessly multiplied temporary memory during FST scans.
+        output.extend_from_slice(&bytes[start..end]);
         self.lru.retain(|&item| item != index);
         self.lru.push_back(index);
-        Some(bytes)
+        true
     }
 
     fn insert(&mut self, index: u64, bytes: Vec<u8>) {
@@ -80,24 +89,42 @@ impl FileRangeReader {
         while cursor < end {
             let chunk_index = cursor / CHUNK_SIZE as u64;
             let chunk_start = chunk_index * CHUNK_SIZE as u64;
-            let cached = { self.cache.borrow_mut().get(chunk_index) };
-            let chunk = if let Some(bytes) = cached {
-                bytes
-            } else {
+            let within = (cursor - chunk_start) as usize;
+            let expected_chunk_len = ((self.len() - chunk_start).min(CHUNK_SIZE as u64)) as usize;
+            let take = ((end - cursor) as usize).min(expected_chunk_len.saturating_sub(within));
+            if take == 0 {
+                return Err(JsValue::from_str("browser returned an incomplete disc chunk"));
+            }
+
+            let cache_hit = {
+                self.cache.borrow_mut().copy_range(
+                    chunk_index,
+                    within,
+                    within + take,
+                    &mut output,
+                )
+            };
+            if !cache_hit {
                 let slice_end = (chunk_start + CHUNK_SIZE as u64).min(self.len());
                 let blob = self.file.slice_with_f64_and_f64(chunk_start as f64, slice_end as f64)?;
                 let array_buffer = JsFuture::from(blob.array_buffer()).await?;
                 let bytes = js_sys::Uint8Array::new(&array_buffer).to_vec();
-                self.cache.borrow_mut().insert(chunk_index, bytes.clone());
-                bytes
-            };
-
-            let within = (cursor - chunk_start) as usize;
-            if within >= chunk.len() {
-                return Err(JsValue::from_str("browser returned an incomplete disc chunk"));
+                if bytes.len() != expected_chunk_len {
+                    return Err(JsValue::from_str("browser returned an incomplete disc chunk"));
+                }
+                self.cache.borrow_mut().insert(chunk_index, bytes);
+                let copied = {
+                    self.cache.borrow_mut().copy_range(
+                        chunk_index,
+                        within,
+                        within + take,
+                        &mut output,
+                    )
+                };
+                if !copied {
+                    return Err(JsValue::from_str("failed to cache browser disc chunk"));
+                }
             }
-            let take = ((end - cursor) as usize).min(chunk.len() - within);
-            output.extend_from_slice(&chunk[within..within + take]);
             cursor += take as u64;
         }
         Ok(output)
@@ -236,5 +263,44 @@ impl BrowserDiscReader {
             self.inner.len(),
             if matching_stream_names.is_empty() { "(none in this scan)".to_string() } else { matching_stream_names.join(", ") }
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cache;
+
+    #[test]
+    fn cache_copies_only_requested_range_and_updates_lru() {
+        let mut cache = Cache::new();
+        cache.insert(3, vec![10, 11, 12, 13, 14]);
+        let mut out = Vec::new();
+        assert!(cache.copy_range(3, 1, 4, &mut out));
+        assert_eq!(out, vec![11, 12, 13]);
+        assert_eq!(cache.lru.back(), Some(&3));
+    }
+
+    #[test]
+    fn cache_miss_and_invalid_ranges_do_not_copy() {
+        let mut cache = Cache::new();
+        cache.insert(1, vec![1, 2, 3]);
+        let mut out = Vec::new();
+        assert!(!cache.copy_range(9, 0, 1, &mut out));
+        assert!(!cache.copy_range(1, 0, 4, &mut out));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_chunk() {
+        let mut cache = Cache::new();
+        for index in 0..16 {
+            cache.insert(index, vec![index as u8]);
+        }
+        let mut out = Vec::new();
+        assert!(cache.copy_range(0, 0, 1, &mut out));
+        cache.insert(16, vec![16]);
+        assert!(!cache.chunks.contains_key(&1));
+        assert!(cache.chunks.contains_key(&0));
+        assert!(cache.chunks.contains_key(&16));
     }
 }
