@@ -125,3 +125,33 @@ This confirms the JavaScript LRU cache's bounded behavior and sampled byte-for-b
 Before implementing a yield/resume design, map the concrete call sites and boot-time dependencies of `Dvd::read_disc_into` and `Dvd::read_raw_disc`, including apploader loading, FST/file access, DVD command handling, and any reads performed while the CPU/system scheduler is running. For each call site, record whether it can return a pending-read result without exposing partially filled buffers or violating device timing.
 
 Do not change the trait to async in isolation: this is a broad interface used by the core, and an async read must be propagated to the emulation scheduler and DVD command state machine. Keep the public Pages workflow unchanged until this path can be built and tested end-to-end.
+
+
+## Synchronous read call-graph investigation (2026-10-17)
+
+Source inspection identified two separate boot/runtime read paths. This is the concrete scope that must be addressed before a browser File range source can replace the in-memory ISO.
+
+### 1. Wii HLE boot path
+
+- `crates/gecko/src/wii.rs::apploader_hle_run` reads the TMD through `Dvd::tmd_ios_title_id` and `Dvd::tmd_title_id` during low-memory setup. Those default trait methods call synchronous `read_raw_disc`.
+- The same function reads the apploader image synchronously into emulated RAM with `read_disc_into`.
+- `Wii::run_apploader` repeatedly calls `emu.run_until(...)` to execute apploader functions. After each `Apploader_Main` return, it reads destination address, byte length, and a word-based disc offset from emulated memory, then immediately copies that range with `dvd.read_disc_into`.
+- This is a boot-time control loop, not merely a background data fetch. It must become a resumable boot state machine: preserve emulated CPU state and the requested read, await the range, copy it into RAM, then continue with the next apploader phase. A direct async replacement cannot be awaited inside the current synchronous loop.
+
+### 2. Runtime DVD Interface (DI)
+
+- `crates/gecko/src/dvd.rs::start_transfer` resolves a DI command and calls `process_dvd_command` synchronously before scheduling `DiTransferDone`.
+- `process_dvd_command` handles `ReadSectorData` and `ReadDiskId` by obtaining an emulated RAM buffer and calling `dvd.read_disc_into` immediately.
+- The existing scheduler already models a delay before the transfer-complete interrupt, but the data has been copied before that delay. Browser streaming needs a pending-transfer state: capture command/source/destination/length, request the bytes asynchronously, copy the completed bytes into emulated RAM, and only then signal transfer completion according to device timing. The CPU must not observe a completed transfer before the data is available.
+- Other synchronous disc calls may be reached through the `Dvd` trait defaults and must be audited as part of the same change.
+
+### Implementation implication
+
+The viable direction under the observed Android constraints is **not** a synchronous Rust-to-JavaScript bridge and not a worker that blocks waiting for `File.slice().arrayBuffer()`. Instead, split the work into two explicit resumable state machines:
+
+1. **Boot/apploader state machine:** stages for metadata reads, apploader-code load, entry/init/main calls, pending file read, and final entrypoint. Each stage advances only after its required data is available.
+2. **Runtime DI transfer state machine:** retain the command and transfer parameters while a range is pending; on completion, write the returned bytes into emulated RAM and resume the normal scheduler/interrupt flow.
+
+The JavaScript side should own the selected File and bounded LRU range cache, and return each requested range as a message to Rust/WASM. The Rust side must never retain the full ISO. Before coding, define message IDs, cancellation/error behavior, EOF handling, and how an in-flight transfer pauses CPU execution while keeping rendering/input responsive.
+
+This investigation maps the principal call sites but is not yet an implementation. No Rust source or public Pages workflow has been changed by this section.
