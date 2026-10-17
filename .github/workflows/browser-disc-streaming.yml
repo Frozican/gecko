@@ -38,6 +38,6 @@ jobs:
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
       - name: Check browser frontend
-        run: cargo check -p web --target wasm32-unknown-unknown
+        run: cargo check --manifest-path crates/web/Cargo.toml --target wasm32-unknown-unknown
       - name: Run browser reader unit tests
-        run: cargo test -p web --target x86_64-unknown-linux-gnu disc_stream::tests
+        run: cargo test --manifest-path crates/web/Cargo.toml --lib disc_stream::tests
