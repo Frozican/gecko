@@ -155,3 +155,31 @@ The viable direction under the observed Android constraints is **not** a synchro
 The JavaScript side should own the selected File and bounded LRU range cache, and return each requested range as a message to Rust/WASM. The Rust side must never retain the full ISO. Before coding, define message IDs, cancellation/error behavior, EOF handling, and how an in-flight transfer pauses CPU execution while keeping rendering/input responsive.
 
 This investigation maps the principal call sites but is not yet an implementation. No Rust source or public Pages workflow has been changed by this section.
+
+
+## Web frontend integration blocker (2026-10-17)
+
+A further source audit found that `crates/web/src/lib.rs` currently exposes
+`start_emulator(rom_data, filename, dsp_irom)`, but its non-IPL path parses the
+input as a GameCube DOL (`Dol::parse` / `GameCube::with_image`). The web
+`App` also stores a `GameCube`, not a Wii system. Therefore, adding a range
+reader alone cannot boot a Wii disc in the current web frontend: the frontend
+needs a Wii-disc launch path and must construct `Wii::apploader_hle(...)`
+using a disc implementation that supports the required metadata and range reads.
+
+This is a distinct prerequisite from asynchronous I/O. Keep the implementation
+split into testable layers:
+
+1. Add a Wii-disc launch/API path without changing the existing GameCube DOL
+   path.
+2. Introduce a disc-range request broker with request IDs, bounded-cache reads,
+   error/EOF reporting, and cancellation.
+3. Make Wii apploader boot resumable across pending reads; preserve the CPU
+   state and pending destination/length/offset.
+4. Make runtime DI reads resumable and only signal transfer completion after
+   bytes have been copied to emulated RAM.
+5. Build and run automated checks before connecting the new launch path to the
+   public Pages site.
+
+No frontend or emulator runtime code has been changed by this audit. In
+particular, no Wii boot or game-play success is claimed.
