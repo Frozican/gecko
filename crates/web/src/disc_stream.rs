@@ -16,6 +16,14 @@ const MAX_CACHED_CHUNKS: usize = 16;
 // Prevent a JavaScript caller from requesting a multi-gigabyte allocation in one read.
 // Streaming consumers should request bounded chunks and await each read.
 const MAX_READ_LENGTH: usize = 16 * 1024 * 1024;
+
+fn validate_read_length(length: usize) -> Result<(), &'static str> {
+    if length > MAX_READ_LENGTH {
+        Err("disc read exceeds the 16 MiB per-request limit")
+    } else {
+        Ok(())
+    }
+}
 const MAX_NKIT_PARTITIONS: u32 = 10_000;
 const MAX_FST_SIZE: usize = 64 * 1024 * 1024;
 
@@ -80,9 +88,7 @@ impl FileRangeReader {
     }
 
     pub(crate) async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, JsValue> {
-        if length > MAX_READ_LENGTH {
-            return Err(JsValue::from_str("disc read exceeds the 16 MiB per-request limit"));
-        }
+        validate_read_length(length).map_err(JsValue::from_str)?
         let end = offset.checked_add(length as u64)
             .ok_or_else(|| JsValue::from_str("disc range overflow"))?;
         if end > self.len() {
@@ -166,9 +172,7 @@ impl BrowserDiscReader {
         offset: f64,
         length: u32,
     ) -> Result<js_sys::Uint8Array, JsValue> {
-        if length as usize > MAX_READ_LENGTH {
-            return Err(JsValue::from_str("disc read exceeds the 16 MiB per-request limit"));
-        }
+        validate_read_length(length as usize).map_err(JsValue::from_str)?;
         if !offset.is_finite() || offset < 0.0 || offset.fract() != 0.0 {
             return Err(JsValue::from_str("disc offset must be a non-negative integer"));
         }
@@ -277,7 +281,14 @@ impl BrowserDiscReader {
 
 #[cfg(test)]
 mod tests {
-    use super::Cache;
+    use super::{validate_read_length, Cache, MAX_READ_LENGTH};
+
+    #[test]
+    fn read_length_limit_accepts_bounded_reads_and_rejects_large_allocations() {
+        assert!(validate_read_length(0).is_ok());
+        assert!(validate_read_length(MAX_READ_LENGTH).is_ok());
+        assert!(validate_read_length(MAX_READ_LENGTH + 1).is_err());
+    }
 
     #[test]
     fn cache_copies_only_requested_range_and_updates_lru() {
