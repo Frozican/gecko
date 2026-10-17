@@ -19,6 +19,7 @@
   <label>Disc image file: <input id="file" type="file"></label>
   <div>
     <button id="run" disabled>Run bounded range tests</button>
+    <button id="probe" disabled>Probe NKit metadata</button>
     <button id="clear">Clear output</button>
   </div>
   <pre id="output" aria-live="polite">Choose a disc image to begin.</pre>
@@ -27,6 +28,7 @@
 
     const fileInput = document.querySelector("#file");
     const runButton = document.querySelector("#run");
+    const probeButton = document.querySelector("#probe");
     const output = document.querySelector("#output");
     let wasmReady = false;
 
@@ -41,9 +43,24 @@
 
     fileInput.addEventListener("change", () => {
       runButton.disabled = !wasmReady || !fileInput.files?.length;
+      probeButton.disabled = !wasmReady || !fileInput.files?.length;
       output.textContent = fileInput.files?.length
         ? "Selected: " + fileInput.files[0].name + " (" + fileInput.files[0].size.toLocaleString() + " bytes)\n"
         : "Choose a disc image to begin.\n";
+    });
+
+    probeButton.addEventListener("click", async () => {
+      probeButton.disabled = true;
+      try {
+        const file = fileInput.files[0];
+        const reader = new BrowserDiscReader(file);
+        log("\\nStarting bounded NKit metadata probe...");
+        log(await reader.probe_nkit());
+      } catch (error) {
+        log("\\nNKit probe failed: " + (error?.stack || error));
+      } finally {
+        probeButton.disabled = !wasmReady || !fileInput.files?.length;
+      }
     });
 
     document.querySelector("#clear").addEventListener("click", () => {
@@ -91,6 +108,7 @@
       await init();
       wasmReady = true;
       runButton.disabled = !fileInput.files?.length;
+      probeButton.disabled = !fileInput.files?.length;
       log("WASM module initialized.");
     } catch (error) {
       log("WASM initialization failed: " + (error?.stack || error));
