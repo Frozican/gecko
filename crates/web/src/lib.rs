@@ -9,7 +9,7 @@ use egui::ViewportId;
 use gecko::HostInput;
 use gecko::flipper::si::pad::{self, PadStatus, STICK_CENTER, STICK_MAX, STICK_MIN, TRIGGER_MAX, TRIGGER_MIN};
 use gecko::flipper::vi::regs::RefreshRate;
-use gecko::gamecube::GameCube;
+use gecko::wii::Wii;
 use gecko::host::{DrawVertex, GxAction, RenderSink};
 use image::Dol;
 use wasm_bindgen::prelude::*;
@@ -478,7 +478,7 @@ impl State {
 type SharedState = Rc<RefCell<Option<State>>>;
 
 struct App {
-    emulator: GameCube,
+    emulator: Wii,
     input: HostInput,
     action_queue: WebSinkQueue,
     window: Option<Arc<Window>>,
@@ -579,19 +579,25 @@ pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8
     console_error_panic_hook::set_once();
 
     let name = filename.to_lowercase();
-    let mut emulator = if name.ends_with(".iso") || name.ends_with(".rvz") || name.ends_with(".gcm") {
-        // Disc images must enter the DVD/apploader boot path. Parsing them as
-        // DOL executables produces a blank screen instead of booting the game.
-        // RVZ decoding is enabled for this web crate via image's "rvz" feature.
-        GameCube::with_ipl_hle(image::load_dvd(rom_data.to_vec()))
-    } else if name.ends_with(".bin") || name.ends_with(".ipl") {
-        GameCube::with_ipl(rom_data, false)
+    let mut emulator = if name.ends_with(".iso") || name.ends_with(".rvz") {
+        // This page is a Wii emulator: use Gecko's Wii system and Wii
+        // apploader HLE. The GameCube IPL boot path initializes the wrong
+        // hardware model for Wii discs and can leave the display black.
+        // RVZ support is enabled for this web crate via image's "rvz" feature.
+        let dvd = image::load_dvd(rom_data.to_vec());
+        if !dvd.header().is_wii() {
+            web_sys::console::error_1(
+                &format!("The selected disc is not identified as a Wii disc: {filename}").into(),
+            );
+            return;
+        }
+        Wii::apploader_hle(dvd).build()
     } else if name.ends_with(".dol") {
         let dol = Dol::parse(rom_data.to_vec());
-        GameCube::with_image(&dol)
+        Wii::with_image(&dol)
     } else {
         web_sys::console::error_1(
-            &format!("Unsupported file type: {filename}. Choose a Wii .iso/.rvz, GameCube .gcm, .dol, or .ipl/.bin file.").into(),
+            &format!("Unsupported file type: {filename}. Choose a Wii .iso/.rvz disc image or a Wii .dol executable.").into(),
         );
         return;
     };
