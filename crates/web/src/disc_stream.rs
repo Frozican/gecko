@@ -149,6 +149,77 @@ fn be_u32(bytes: &[u8], offset: usize) -> Result<u32, JsValue> {
     Ok(u32::from_be_bytes(field.try_into().unwrap()))
 }
 
+/// JavaScript-facing range reader for RVZ files. Metadata and compressed data
+/// blocks are fetched independently; the complete RVZ file is never copied into WASM.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub struct BrowserRvzReader {
+    inner: FileRangeReader,
+    index: RefCell<Option<image::rvz::RvzRangeIndex>>,
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+impl BrowserRvzReader {
+    #[wasm_bindgen::prelude::wasm_bindgen(constructor)]
+    pub fn new(file: File) -> BrowserRvzReader {
+        BrowserRvzReader { inner: FileRangeReader::new(file), index: RefCell::new(None) }
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen(getter)]
+    pub fn size(&self) -> f64 { self.inner.len() as f64 }
+
+    /// Fetch only the RVZ header and compressed raw/group tables.
+    pub async fn open(&self) -> Result<String, JsValue> {
+        const HEADER_LEN: usize = 0x11c;
+        const H1: usize = 0x48;
+        let header = self.inner.read_range(0, HEADER_LEN).await?;
+        if header.get(0..4) != Some(b"RVZ\x01") {
+            return Err(JsValue::from_str("not an RVZ file (bad magic)"));
+        }
+        let raw_offset = be_u64(&header, H1 + 0xb8)?;
+        let raw_size = be_u32(&header, H1 + 0xc0)? as usize;
+        let groups_offset = be_u64(&header, H1 + 0xc8)?;
+        let groups_size = be_u32(&header, H1 + 0xd0)? as usize;
+        if raw_size > MAX_READ_LENGTH || groups_size > MAX_READ_LENGTH {
+            return Err(JsValue::from_str("RVZ metadata table exceeds 16 MiB safety limit"));
+        }
+        let raw_payload = self.inner.read_range(raw_offset, raw_size).await?;
+        let groups_payload = self.inner.read_range(groups_offset, groups_size).await?;
+        let index = image::rvz::RvzRangeIndex::from_ranges(&header, &raw_payload, &groups_payload)
+            .map_err(|error| JsValue::from_str(&error))?;
+        let summary = format!(
+            "RVZ range index ready\nFile size: {} bytes\nLogical disc size: {} bytes\nChunk size: {} bytes\nCompression type: {}\nRaw-data entries and group table parsed without loading the whole file. This is the block I/O layer; Wii partition selection/decryption and emulator DI integration are still separate steps.",
+            self.inner.len(), index.iso_size, index.chunk_size, index.compression_type
+        );
+        *self.index.borrow_mut() = Some(index);
+        Ok(summary)
+    }
+
+    /// Fetch and decode exactly the compressed RVZ block containing a logical disc offset.
+    pub async fn read_block(&self, disc_offset: f64) -> Result<js_sys::Uint8Array, JsValue> {
+        if !disc_offset.is_finite() || disc_offset < 0.0 || disc_offset.fract() != 0.0 || disc_offset > u64::MAX as f64 {
+            return Err(JsValue::from_str("disc offset must be a non-negative integer"));
+        }
+        let (descriptor, group_offset, output_size, compression_type) = {
+            let index = self.index.borrow();
+            let index = index.as_ref().ok_or_else(|| JsValue::from_str("call open() before reading RVZ blocks"))?;
+            let (descriptor, group_offset, output_size) = index.block_for_disc_offset(disc_offset as u64)
+                .map_err(|error| JsValue::from_str(&error))?;
+            (descriptor, group_offset, output_size, index.compression_type)
+        };
+        let payload = self.inner.read_range(descriptor.file_offset, descriptor.stored_size as usize).await?;
+        let decoded = image::rvz::decode_block_payload(
+            &payload, descriptor, compression_type, output_size, group_offset
+        ).map_err(|error| JsValue::from_str(&error))?;
+        Ok(js_sys::Uint8Array::from(decoded.as_slice()))
+    }
+}
+
+fn be_u64(bytes: &[u8], offset: usize) -> Result<u64, JsValue> {
+    let field = bytes.get(offset..offset + 8)
+        .ok_or_else(|| JsValue::from_str("truncated RVZ header"))?;
+    Ok(u64::from_be_bytes(field.try_into().unwrap()))
+}
+
 /// JavaScript-facing handle for bounded disc reads and metadata probes.
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub struct BrowserDiscReader {
