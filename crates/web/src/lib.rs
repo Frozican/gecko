@@ -556,7 +556,7 @@ impl ApplicationHandler for App {
                         self.freecam_input_blocked = self.debug_state.freecam.enabled;
 
                         if self.freecam_input_blocked {
-                            self.emulator.apply_host_input(&HostInput::gc_connected());
+                            self.emulator.apply_host_input(&HostInput::wii_neutral());
                         } else {
                             self.emulator.apply_host_input(&self.input);
                         }
