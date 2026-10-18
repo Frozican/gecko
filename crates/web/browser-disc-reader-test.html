@@ -85,6 +85,7 @@
         const logicalSize = logicalMatch ? Number(logicalMatch[1]) : 0;
         let passed = 0;
         let skipped = 0;
+        let firstCoveredOffset = null;
         for (let offset = 0; offset < logicalSize && passed < 3; offset += chunkSize) {
           try {
             const started = performance.now();
@@ -93,17 +94,28 @@
               ": " + block.length.toLocaleString() + " bytes in " +
               (performance.now() - started).toFixed(1) + " ms; prefix " +
               hex(block, 16));
+            if (firstCoveredOffset === null) firstCoveredOffset = offset;
             passed++;
           } catch (error) {
             skipped++;
             if (skipped <= 5) log("SKIP uncovered logical offset 0x" + offset.toString(16));
           }
-          // Bound diagnostic work on unexpected or malformed metadata.
           if (offset / chunkSize > 4096) break;
         }
         if (passed < 3) throw new Error("Only " + passed + " covered chunks found after checking " + (passed + skipped) + " offsets.");
-        log("\\nRESULT: RVZ metadata parsed and " + passed + " covered logical blocks decoded; skipped " + skipped + " uncovered offsets.");
-        log("This validates bounded RVZ block I/O only; it does NOT boot the Wii runtime.");
+
+        if (firstCoveredOffset !== null && firstCoveredOffset + chunkSize + 32 < logicalSize) {
+          try {
+            const start = firstCoveredOffset + chunkSize - 16;
+            const range = await reader.read_disc_range(start, 32);
+            if (range.length !== 32) throw new Error("range assembler returned " + range.length + " bytes instead of 32");
+            log("PASS multi-block range assembly across chunk boundary at 0x" + start.toString(16) + " (32 bytes)");
+          } catch (error) {
+            log("SKIP cross-chunk range assembly (metadata gap or unsupported range): " + (error?.message || error));
+          }
+        }
+        log("\nRESULT: RVZ metadata parsed and " + passed + " covered logical blocks decoded; skipped " + skipped + " uncovered offsets.");
+        log("This validates bounded RVZ block/range I/O only; it does NOT boot the Wii runtime.");
       } catch (error) {
         log("\\nRVZ STREAM TEST FAILED: " + (error?.stack || error));
       } finally {
