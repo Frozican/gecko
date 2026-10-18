@@ -615,12 +615,12 @@ pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8
 
 fn update_wii_input(input: &mut HostInput, key: KeyCode, pressed: bool) {
     if let HostInput::Wii { wiimote_buttons, nunchuk_stick_x, nunchuk_stick_y, .. } = input {
-        const A: u16 = 1 << 0;
-        const B: u16 = 1 << 1;
-        const ONE: u16 = 1 << 2;
-        const TWO: u16 = 1 << 3;
-        const PLUS: u16 = 1 << 4;
-        const MINUS: u16 = 1 << 5;
+        const A: u16 = 0x0008;
+        const B: u16 = 0x0004;
+        const ONE: u16 = 0x0002;
+        const TWO: u16 = 0x0001;
+        const PLUS: u16 = 0x1000;
+        const MINUS: u16 = 0x0010;
         let mask = match key {
             KeyCode::KeyZ => A,
             KeyCode::KeyX => B,
