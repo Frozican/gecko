@@ -211,10 +211,10 @@ impl BrowserRvzReader {
         }
         let start = disc_offset as u64;
         let end = start.checked_add(length as u64).ok_or_else(|| JsValue::from_str("disc range overflow"))?;
-        let (logical_size, chunk_size) = {
+        let logical_size = {
             let index = self.index.borrow();
             let index = index.as_ref().ok_or_else(|| JsValue::from_str("call open() before reading RVZ ranges"))?;
-            (index.iso_size, index.chunk_size as u64)
+            index.iso_size
         };
         if end > logical_size {
             return Err(JsValue::from_str("disc range extends beyond logical disc size"));
@@ -224,7 +224,11 @@ impl BrowserRvzReader {
         let mut cursor = start;
         while cursor < end {
             let block = self.read_block(cursor as f64).await?;
-            let in_block = (cursor % chunk_size) as usize;
+            let in_block = {
+                let index = self.index.borrow();
+                index.as_ref().ok_or_else(|| JsValue::from_str("RVZ index was cleared during read"))?
+                    .offset_in_block(cursor).map_err(|error| JsValue::from_str(&error))?
+            };
             if in_block >= block.length() as usize {
                 return Err(JsValue::from_str("invalid RVZ chunk boundary while assembling disc range"));
             }
