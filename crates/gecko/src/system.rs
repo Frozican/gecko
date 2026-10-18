@@ -261,7 +261,7 @@ impl<const SYSTEM: SystemId> System<SYSTEM> {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn run_until_vsync(&mut self) {
         self.prepare_frame();
-        while !self.vsync_pending {
+        while !self.vsync_pending && self.pending_async_disc_read().is_none() {
             self.scheduler.refresh_deadline();
             #[cfg(feature = "jit")]
             if self.execution_mode == ExecutionMode::Jit {

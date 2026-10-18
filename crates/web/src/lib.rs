@@ -11,6 +11,8 @@ use gecko::Wii;
 use gecko::host::{DrawVertex, GxAction, RenderSink};
 
 use wasm_bindgen::prelude::*;
+
+mod disc_stream;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
