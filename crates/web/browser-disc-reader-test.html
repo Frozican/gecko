@@ -71,7 +71,7 @@
       rvzButton.disabled = true;
       try {
         const file = fileInput.files[0];
-        log("\\nStarting RVZ block-streaming test for " + file.name + "...");
+        log("\nStarting RVZ block-streaming test for " + file.name + "...");
         const reader = new BrowserRvzReader(file);
         const summary = await reader.open();
         log("PASS RVZ metadata/index: ");
@@ -79,9 +79,9 @@
         // RVZ raw-data entries can leave logical disc gaps uncovered. Probe
         // chunk-aligned offsets and skip gaps instead of treating one gap as a
         // broken file. Read distinct chunks, not multiple offsets in one chunk.
-        const chunkMatch = summary.match(/Chunk size: (\\d+) bytes/);
+        const chunkMatch = summary.match(/Chunk size: (\d+) bytes/);
         const chunkSize = chunkMatch ? Number(chunkMatch[1]) : 131072;
-        const logicalMatch = summary.match(/Logical disc size: (\\d+) bytes/);
+        const logicalMatch = summary.match(/Logical disc size: (\d+) bytes/);
         const logicalSize = logicalMatch ? Number(logicalMatch[1]) : 0;
         let passed = 0;
         let skipped = 0;
@@ -117,7 +117,7 @@
         log("\nRESULT: RVZ metadata parsed and " + passed + " covered logical blocks decoded; skipped " + skipped + " uncovered offsets.");
         log("This validates bounded RVZ block/range I/O only; it does NOT boot the Wii runtime.");
       } catch (error) {
-        log("\\nRVZ STREAM TEST FAILED: " + (error?.stack || error));
+        log("\nRVZ STREAM TEST FAILED: " + (error?.stack || error));
       } finally {
         rvzButton.disabled = !wasmReady || !fileInput.files?.length;
       }
