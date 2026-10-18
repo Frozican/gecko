@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use egui::ViewportId;
 use gecko::HostInput;
-use gecko::flipper::si::pad::{self, PadStatus, STICK_CENTER, STICK_MAX, STICK_MIN, TRIGGER_MAX, TRIGGER_MIN};
+
 use gecko::flipper::vi::regs::RefreshRate;
-use gecko::gamecube::GameCube;
+use gecko::Wii;
 use gecko::host::{DrawVertex, GxAction, RenderSink};
-use image::Dol;
+
 use wasm_bindgen::prelude::*;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -304,7 +304,7 @@ impl State {
 
     fn render(
         &mut self,
-        emulator: &mut GameCube,
+        emulator: &mut Wii,
         action_queue: &WebSinkQueue,
         #[cfg(feature = "debug")] debug_state: &mut debug_ui::DebugState,
         window: &Window,
@@ -476,7 +476,7 @@ impl State {
 type SharedState = Rc<RefCell<Option<State>>>;
 
 struct App {
-    emulator: GameCube,
+    emulator: Wii,
     input: HostInput,
     action_queue: WebSinkQueue,
     window: Option<Arc<Window>>,
@@ -529,9 +529,7 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state.is_pressed();
                 if let PhysicalKey::Code(key) = event.physical_key {
-                    if let HostInput::Gc(pad) = &mut self.input {
-                        update_pad(pad, key, pressed);
-                    }
+                    update_wii_input(&mut self.input, key, pressed);
 
                     #[cfg(feature = "debug")]
                     if self.debug_state.freecam.enabled {
@@ -576,31 +574,15 @@ impl ApplicationHandler for App {
 pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8>>) {
     console_error_panic_hook::set_once();
 
-    let name = filename.to_lowercase();
-
-    // This web entry point currently boots GameCube IPL/DOL images only.
-    // Do not pass large Wii disc images to Dol::parse: it copies the entire
-    // upload into a Vec and then interprets it as an executable, which can
-    // exhaust WebAssembly memory on mobile before producing a useful error.
-    if name.ends_with(".rvz") || name.ends_with(".iso") || name.ends_with(".gcm") {
-        web_sys::console::error_1(&JsValue::from_str(
-            "Wii/GameCube disc boot is not wired into the web entry point yet. RVZ/ISO files cannot be booted here; use a supported .dol, .bin, or .ipl image.",
-        ));
-        return;
-    }
-
-    let mut emulator = if name.ends_with(".bin") || name.ends_with(".ipl") {
-        GameCube::with_ipl(rom_data, false)
-    } else {
-        let dol = Dol::parse(rom_data.to_vec());
-        GameCube::with_image(&dol)
-    };
+    let _name = filename.to_lowercase();
+    let dvd = image::load_dvd(rom_data.to_vec());
+    let mut emulator = Wii::apploader_hle(dvd).build();
 
     if let Some(irom) = dsp_irom {
         emulator.dsp.load_irom(&irom);
     }
 
-    let input = HostInput::gc_connected();
+    let input = HostInput::wii_neutral();
     emulator.apply_host_input(&input);
 
     // Install the WebSink as the emulator's render sink.
@@ -631,38 +613,37 @@ pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8
     event_loop.spawn_app(app);
 }
 
-fn update_pad(pad: &mut PadStatus, key: KeyCode, pressed: bool) {
-    let set_button = |buttons: &mut u16, mask: u16, on: bool| {
-        if on {
-            *buttons |= mask;
-        } else {
-            *buttons &= !mask;
+fn update_wii_input(input: &mut HostInput, key: KeyCode, pressed: bool) {
+    if let HostInput::Wii { wiimote_buttons, nunchuk_stick_x, nunchuk_stick_y, .. } = input {
+        const A: u16 = 1 << 0;
+        const B: u16 = 1 << 1;
+        const ONE: u16 = 1 << 2;
+        const TWO: u16 = 1 << 3;
+        const PLUS: u16 = 1 << 4;
+        const MINUS: u16 = 1 << 5;
+        let mask = match key {
+            KeyCode::KeyZ => A,
+            KeyCode::KeyX => B,
+            KeyCode::KeyC => ONE,
+            KeyCode::KeyV => TWO,
+            KeyCode::Enter => PLUS,
+            KeyCode::Backspace => MINUS,
+            _ => 0,
+        };
+        if mask != 0 {
+            if pressed { *wiimote_buttons |= mask; } else { *wiimote_buttons &= !mask; }
         }
-    };
-
-    match key {
-        KeyCode::ArrowUp => pad.stick_y = if pressed { STICK_MAX } else { STICK_CENTER },
-        KeyCode::ArrowDown => pad.stick_y = if pressed { STICK_MIN } else { STICK_CENTER },
-        KeyCode::ArrowLeft => pad.stick_x = if pressed { STICK_MIN } else { STICK_CENTER },
-        KeyCode::ArrowRight => pad.stick_x = if pressed { STICK_MAX } else { STICK_CENTER },
-        KeyCode::KeyX => set_button(&mut pad.buttons, pad::A, pressed),
-        KeyCode::KeyZ => set_button(&mut pad.buttons, pad::B, pressed),
-        KeyCode::KeyC => set_button(&mut pad.buttons, pad::X, pressed),
-        KeyCode::KeyV => set_button(&mut pad.buttons, pad::Y, pressed),
-        KeyCode::Enter => set_button(&mut pad.buttons, pad::START, pressed),
-        KeyCode::KeyA => {
-            set_button(&mut pad.buttons, pad::L, pressed);
-            pad.trigger_left = if pressed { TRIGGER_MAX } else { TRIGGER_MIN };
-        }
-        KeyCode::KeyS => {
-            set_button(&mut pad.buttons, pad::R, pressed);
-            pad.trigger_right = if pressed { TRIGGER_MAX } else { TRIGGER_MIN };
-        }
-        KeyCode::KeyD => set_button(&mut pad.buttons, pad::Z, pressed),
-        KeyCode::KeyI => set_button(&mut pad.buttons, pad::DPAD_UP, pressed),
-        KeyCode::KeyK => set_button(&mut pad.buttons, pad::DPAD_DOWN, pressed),
-        KeyCode::KeyJ => set_button(&mut pad.buttons, pad::DPAD_LEFT, pressed),
-        KeyCode::KeyL => set_button(&mut pad.buttons, pad::DPAD_RIGHT, pressed),
-        _ => {}
+        *nunchuk_stick_x = match key {
+            KeyCode::ArrowLeft if pressed => 0,
+            KeyCode::ArrowRight if pressed => 255,
+            KeyCode::ArrowLeft | KeyCode::ArrowRight if !pressed => 128,
+            _ => *nunchuk_stick_x,
+        };
+        *nunchuk_stick_y = match key {
+            KeyCode::ArrowDown if pressed => 0,
+            KeyCode::ArrowUp if pressed => 255,
+            KeyCode::ArrowUp | KeyCode::ArrowDown if !pressed => 128,
+            _ => *nunchuk_stick_y,
+        };
     }
 }
