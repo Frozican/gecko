@@ -58,6 +58,66 @@ struct GroupEntry {
     rvz_packed_size: u32,
 }
 
+/// Metadata needed to decode one RVZ data block after its byte range has been
+/// fetched. This makes block decoding independent of the complete file buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RvzBlockDescriptor {
+    pub file_offset: u64,
+    pub stored_size: u32,
+    pub is_compressed: bool,
+    pub rvz_packed_size: u32,
+}
+
+/// Decode one already-fetched RVZ block payload. The caller may obtain payload
+/// with a ranged read and discard it after consuming the decoded chunk.
+/// compression_type follows the RVZ header values (0 = none, 5 = Zstandard).
+pub fn decode_block_payload(
+    payload: &[u8],
+    descriptor: RvzBlockDescriptor,
+    compression_type: u32,
+    output_size: usize,
+    group_offset_in_data: u64,
+) -> Result<Vec<u8>, String> {
+    if payload.len() != descriptor.stored_size as usize {
+        return Err(format!(
+            "RVZ block payload length mismatch: expected {}, got {}",
+            descriptor.stored_size,
+            payload.len()
+        ));
+    }
+    if descriptor.stored_size == 0 {
+        return Ok(vec![0; output_size]);
+    }
+
+    let effective = if descriptor.is_compressed {
+        compression_type
+    } else {
+        0
+    };
+    let decompressed = match effective {
+        0 => payload.to_vec(),
+        5 => zstd::decode_all(std::io::Cursor::new(payload))
+            .map_err(|error| format!("failed to zstd-decode RVZ block: {error}"))?,
+        other => return Err(format!("unsupported RVZ compression type {other}")),
+    };
+
+    if descriptor.rvz_packed_size == 0 {
+        let mut out = vec![0; output_size];
+        let n = core::cmp::min(decompressed.len(), output_size);
+        out[..n].copy_from_slice(&decompressed[..n]);
+        Ok(out)
+    } else {
+        if decompressed.len() != descriptor.rvz_packed_size as usize {
+            return Err(format!(
+                "RVZ packed block size mismatch: expected {}, got {}",
+                descriptor.rvz_packed_size,
+                decompressed.len()
+            ));
+        }
+        Ok(self::rvz_unpack(&decompressed, output_size, group_offset_in_data))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WiiPartitionData {
     first_sector: u32,
@@ -352,39 +412,25 @@ fn decompress_group(
     file_compression: Compression,
     group_offset_in_data: u64,
 ) -> Vec<u8> {
-    if group.stored_size == 0 {
-        return vec![0u8; this_chunk_size];
-    }
-
     let start = group.file_offset as usize;
-    let end = start + group.stored_size as usize;
-    let payload = &file[start..end];
-
-    let effective = if group.is_compressed {
-        file_compression
-    } else {
-        Compression::None
-    };
-
-    let decompressed: Vec<u8> = match effective {
-        Compression::None => payload.to_vec(),
-        Compression::Zstd => zstd::decode_all(std::io::Cursor::new(payload)).expect("failed to zstd-decode group"),
-    };
-
-    if group.rvz_packed_size == 0 {
-        let mut out = vec![0u8; this_chunk_size];
-        let n = core::cmp::min(decompressed.len(), this_chunk_size);
-        out[..n].copy_from_slice(&decompressed[..n]);
-        out
-    } else {
-        assert_eq!(
-            decompressed.len(),
-            group.rvz_packed_size as usize,
-            "rvz_packed_size mismatch"
-        );
-
-        self::rvz_unpack(&decompressed, this_chunk_size, group_offset_in_data)
-    }
+    let end = start.checked_add(group.stored_size as usize)
+        .expect("RVZ block range overflow");
+    let payload = file.get(start..end).expect("RVZ block extends beyond file");
+    self::decode_block_payload(
+        payload,
+        RvzBlockDescriptor {
+            file_offset: group.file_offset,
+            stored_size: group.stored_size,
+            is_compressed: group.is_compressed,
+            rvz_packed_size: group.rvz_packed_size,
+        },
+        match file_compression {
+            Compression::None => 0,
+            Compression::Zstd => 5,
+        },
+        this_chunk_size,
+        group_offset_in_data,
+    ).expect("failed to decode RVZ block")
 }
 
 fn rvz_unpack(src: &[u8], out_len: usize, data_offset: u64) -> Vec<u8> {
