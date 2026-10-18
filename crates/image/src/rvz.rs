@@ -131,6 +131,91 @@ struct WiiPartition {
     data: [WiiPartitionData; 2],
 }
 
+
+/// Metadata index constructed from bounded RVZ header/table range reads.
+pub struct RvzRangeIndex {
+    pub iso_size: u64,
+    pub chunk_size: u32,
+    pub compression_type: u32,
+    pub disc_header: [u8; DISC_HEADER_SIZE],
+    raw_data: Vec<RawData>,
+    groups: Vec<GroupEntry>,
+}
+
+impl RvzRangeIndex {
+    /// header must contain at least 0x118 bytes; table payloads are the exact
+    /// file ranges specified by the header's raw-data and group table offsets.
+    pub fn from_ranges(header: &[u8], raw_data_payload: &[u8], groups_payload: &[u8]) -> Result<Self, String> {
+        const HEADER_REQUIRED: usize = H1_SIZE + H2_GROUPS_SIZE + 4;
+        if header.len() < HEADER_REQUIRED {
+            return Err(format!("RVZ header range too short: {} < {}", header.len(), HEADER_REQUIRED));
+        }
+        if header.get(0..4) != Some(&RVZ_MAGIC) {
+            return Err("not an RVZ file (bad magic)".into());
+        }
+        let disc_type = be32(header, H1_SIZE + H2_DISC_TYPE);
+        if disc_type != 1 && disc_type != 2 {
+            return Err(format!("unsupported RVZ disc type {disc_type}"));
+        }
+        let compression_type = be32(header, H1_SIZE + H2_COMPRESSION_TYPE);
+        let compression = match compression_type {
+            0 => Compression::None,
+            5 => Compression::Zstd,
+            other => return Err(format!("unsupported RVZ compression type {other}")),
+        };
+        let chunk_size = be32(header, H1_SIZE + H2_CHUNK_SIZE);
+        if chunk_size == 0 { return Err("RVZ chunk size is zero".into()); }
+        let num_raw = be32(header, H1_SIZE + H2_NUM_RAW_DATA);
+        let num_groups = be32(header, H1_SIZE + H2_NUM_GROUPS);
+        let raw_expected = (num_raw as usize).checked_mul(RAW_DATA_ENTRY_SIZE)
+            .ok_or_else(|| "RVZ raw-data table size overflow".to_string())?;
+        let groups_expected = (num_groups as usize).checked_mul(RVZ_GROUP_ENTRY_SIZE)
+            .ok_or_else(|| "RVZ group table size overflow".to_string())?;
+        let raw_blob = decompress_metadata_checked(raw_data_payload, compression, raw_expected)?;
+        let groups_blob = decompress_metadata_checked(groups_payload, compression, groups_expected)?;
+        let mut disc_header = [0; DISC_HEADER_SIZE];
+        let h2 = H1_SIZE;
+        disc_header.copy_from_slice(&header[h2 + H2_DISC_HEADER..h2 + H2_DISC_HEADER + DISC_HEADER_SIZE]);
+        Ok(Self {
+            iso_size: be64(header, H1_ISO_FILE_SIZE), chunk_size, compression_type,
+            disc_header, raw_data: parse_raw_data(&raw_blob, num_raw),
+            groups: parse_groups(&groups_blob, num_groups),
+        })
+    }
+
+    /// Resolve a logical disc offset to the compressed file range and output size.
+    pub fn block_for_disc_offset(&self, disc_offset: u64) -> Result<(RvzBlockDescriptor, u64, usize), String> {
+        let raw = self.raw_data.iter()
+            .find(|r| disc_offset >= r.data_offset && disc_offset < r.data_offset.saturating_add(r.data_size))
+            .ok_or_else(|| format!("disc offset {disc_offset:#x} is not covered by RVZ metadata"))?;
+        let within = disc_offset - raw.data_offset;
+        let group_index = within / self.chunk_size as u64;
+        if group_index >= raw.num_groups as u64 {
+            return Err(format!("RVZ group index {group_index} exceeds group count {}", raw.num_groups));
+        }
+        let index = raw.group_index as usize + group_index as usize;
+        let group = self.groups.get(index).ok_or_else(|| format!("RVZ group table index {index} out of range"))?;
+        let group_offset = group_index * self.chunk_size as u64;
+        let output_size = core::cmp::min(self.chunk_size as u64, raw.data_size.saturating_sub(group_offset)) as usize;
+        Ok((RvzBlockDescriptor {
+            file_offset: group.file_offset, stored_size: group.stored_size,
+            is_compressed: group.is_compressed, rvz_packed_size: group.rvz_packed_size,
+        }, group_offset, output_size))
+    }
+}
+
+fn decompress_metadata_checked(payload: &[u8], compression: Compression, expected: usize) -> Result<Vec<u8>, String> {
+    let decompressed = match compression {
+        Compression::None => payload.to_vec(),
+        Compression::Zstd => zstd::decode_all(std::io::Cursor::new(payload))
+            .map_err(|e| format!("failed to decode RVZ metadata: {e}"))?,
+    };
+    if decompressed.len() != expected {
+        return Err(format!("RVZ metadata size mismatch: expected {expected}, got {}", decompressed.len()));
+    }
+    Ok(decompressed)
+}
+
 pub struct Rvz {
     header: Header,
     apploader: Apploader,
