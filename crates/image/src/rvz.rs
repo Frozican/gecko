@@ -194,10 +194,7 @@ impl RvzRangeIndex {
         let raw = self
             .raw_data
             .iter()
-            .find(|r| {
-                disc_offset >= r.data_offset
-                    && disc_offset < r.data_offset.saturating_add(r.data_size)
-            })
+            .find(|r| disc_offset >= r.data_offset && disc_offset < r.data_offset.saturating_add(r.data_size))
             .ok_or_else(|| format!("disc offset {disc_offset:#x} is not covered by RVZ metadata"))?;
         Ok(((disc_offset - raw.data_offset) % self.chunk_size as u64) as usize)
     }
