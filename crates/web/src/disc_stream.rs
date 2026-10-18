@@ -194,6 +194,51 @@ impl BrowserRvzReader {
         Ok(summary)
     }
 
+    /// Read a logical disc range spanning one or more RVZ chunks.
+    ///
+    /// This assembles decoded chunks without retaining the complete image. RVZ
+    /// metadata gaps are reported as errors rather than silently returning
+    /// incorrect bytes; Wii partition decryption is a separate layer.
+    pub async fn read_disc_range(
+        &self,
+        disc_offset: f64,
+        length: u32,
+    ) -> Result<js_sys::Uint8Array, JsValue> {
+        let length = length as usize;
+        validate_read_length(length).map_err(JsValue::from_str)?;
+        if !disc_offset.is_finite() || disc_offset < 0.0 || disc_offset.fract() != 0.0 || disc_offset > u64::MAX as f64 {
+            return Err(JsValue::from_str("disc offset must be a non-negative integer"));
+        }
+        let start = disc_offset as u64;
+        let end = start.checked_add(length as u64).ok_or_else(|| JsValue::from_str("disc range overflow"))?;
+        let (logical_size, chunk_size) = {
+            let index = self.index.borrow();
+            let index = index.as_ref().ok_or_else(|| JsValue::from_str("call open() before reading RVZ ranges"))?;
+            (index.iso_size, index.chunk_size as u64)
+        };
+        if end > logical_size {
+            return Err(JsValue::from_str("disc range extends beyond logical disc size"));
+        }
+        if length == 0 { return Ok(js_sys::Uint8Array::new_with_length(0)); }
+        let mut output = Vec::with_capacity(length);
+        let mut cursor = start;
+        while cursor < end {
+            let block = self.read_block(cursor as f64).await?;
+            let in_block = (cursor % chunk_size) as usize;
+            if in_block >= block.length() as usize {
+                return Err(JsValue::from_str("invalid RVZ chunk boundary while assembling disc range"));
+            }
+            let take = ((end - cursor) as usize).min(block.length() as usize - in_block);
+            if take == 0 {
+                return Err(JsValue::from_str("empty RVZ chunk while assembling disc range"));
+            }
+            let mut decoded = vec![0; block.length() as usize];
+            block.copy_to(&mut decoded);
+            output.extend_from_slice(&decoded[in_block..in_block + take]);
+            cursor += take as u64;
+        }
+        Ok(js_sys::Uint8Array::from(output.as_slice()))
+    }
     /// Fetch and decode exactly the compressed RVZ block containing a logical disc offset.
     pub async fn read_block(&self, disc_offset: f64) -> Result<js_sys::Uint8Array, JsValue> {
         if !disc_offset.is_finite() || disc_offset < 0.0 || disc_offset.fract() != 0.0 || disc_offset > u64::MAX as f64 {
