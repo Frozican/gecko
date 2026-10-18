@@ -577,6 +577,18 @@ pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8
     console_error_panic_hook::set_once();
 
     let name = filename.to_lowercase();
+
+    // This web entry point currently boots GameCube IPL/DOL images only.
+    // Do not pass large Wii disc images to Dol::parse: it copies the entire
+    // upload into a Vec and then interprets it as an executable, which can
+    // exhaust WebAssembly memory on mobile before producing a useful error.
+    if name.ends_with(".rvz") || name.ends_with(".iso") || name.ends_with(".gcm") {
+        web_sys::console::error_1(&JsValue::from_str(
+            "Wii/GameCube disc boot is not wired into the web entry point yet. RVZ/ISO files cannot be booted here; use a supported .dol, .bin, or .ipl image.",
+        ));
+        return;
+    }
+
     let mut emulator = if name.ends_with(".bin") || name.ends_with(".ipl") {
         GameCube::with_ipl(rom_data, false)
     } else {
