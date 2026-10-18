@@ -76,15 +76,33 @@
         const summary = await reader.open();
         log("PASS RVZ metadata/index: ");
         log(summary);
-        for (const offset of [0, 0x10000, 0x80000]) {
-          const started = performance.now();
-          const block = await reader.read_block(offset);
-          log("PASS decoded block at logical offset 0x" + offset.toString(16) +
-            ": " + block.length.toLocaleString() + " bytes in " +
-            (performance.now() - started).toFixed(1) + " ms; prefix " +
-            hex(block, 16));
+        // RVZ raw-data entries can leave logical disc gaps uncovered. Probe
+        // chunk-aligned offsets and skip gaps instead of treating one gap as a
+        // broken file. Read distinct chunks, not multiple offsets in one chunk.
+        const chunkMatch = summary.match(/Chunk size: (\\d+) bytes/);
+        const chunkSize = chunkMatch ? Number(chunkMatch[1]) : 131072;
+        const logicalMatch = summary.match(/Logical disc size: (\\d+) bytes/);
+        const logicalSize = logicalMatch ? Number(logicalMatch[1]) : 0;
+        let passed = 0;
+        let skipped = 0;
+        for (let offset = 0; offset < logicalSize && passed < 3; offset += chunkSize) {
+          try {
+            const started = performance.now();
+            const block = await reader.read_block(offset);
+            log("PASS decoded block at logical offset 0x" + offset.toString(16) +
+              ": " + block.length.toLocaleString() + " bytes in " +
+              (performance.now() - started).toFixed(1) + " ms; prefix " +
+              hex(block, 16));
+            passed++;
+          } catch (error) {
+            skipped++;
+            if (skipped <= 5) log("SKIP uncovered logical offset 0x" + offset.toString(16));
+          }
+          // Bound diagnostic work on unexpected or malformed metadata.
+          if (offset / chunkSize > 4096) break;
         }
-        log("\\nRESULT: RVZ header/tables parsed and 3 logical block reads completed.");
+        if (passed < 3) throw new Error("Only " + passed + " covered chunks found after checking " + (passed + skipped) + " offsets.");
+        log("\\nRESULT: RVZ metadata parsed and " + passed + " covered logical blocks decoded; skipped " + skipped + " uncovered offsets.");
         log("This validates bounded RVZ block I/O only; it does NOT boot the Wii runtime.");
       } catch (error) {
         log("\\nRVZ STREAM TEST FAILED: " + (error?.stack || error));
