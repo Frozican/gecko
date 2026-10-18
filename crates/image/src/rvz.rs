@@ -839,3 +839,61 @@ fn be32(data: &[u8], off: usize) -> u32 {
 fn be64(data: &[u8], off: usize) -> u64 {
     u64::from_be_bytes(data[off..off + 8].try_into().unwrap())
 }
+
+
+#[cfg(test)]
+mod block_decoder_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_an_uncompressed_block_from_a_standalone_payload() {
+        let payload = [1u8, 2, 3, 4];
+        let decoded = decode_block_payload(
+            &payload,
+            RvzBlockDescriptor {
+                file_offset: 0x1000,
+                stored_size: 4,
+                is_compressed: false,
+                rvz_packed_size: 0,
+            },
+            5,
+            4,
+            0,
+        ).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn zero_length_stored_block_expands_to_zeros() {
+        let decoded = decode_block_payload(
+            &[],
+            RvzBlockDescriptor {
+                file_offset: 0,
+                stored_size: 0,
+                is_compressed: true,
+                rvz_packed_size: 0,
+            },
+            5,
+            16,
+            0,
+        ).unwrap();
+        assert_eq!(decoded, vec![0; 16]);
+    }
+
+    #[test]
+    fn rejects_a_payload_with_the_wrong_range_length() {
+        let result = decode_block_payload(
+            &[1, 2],
+            RvzBlockDescriptor {
+                file_offset: 0x100,
+                stored_size: 4,
+                is_compressed: false,
+                rvz_packed_size: 0,
+            },
+            0,
+            4,
+            0,
+        );
+        assert!(result.unwrap_err().contains("payload length mismatch"));
+    }
+}
