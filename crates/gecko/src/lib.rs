@@ -1,3 +1,4 @@
+pub mod async_disc;
 pub mod audio;
 pub mod common;
 pub mod dvd;

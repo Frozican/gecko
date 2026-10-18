@@ -1,5 +1,6 @@
 pub mod regs;
 
+use crate::async_disc::{AsyncDiscPort, DiscReadRequest, DiscReadResponse};
 use crate::system::{System, SystemId};
 
 pub enum Command {
@@ -21,6 +22,9 @@ pub struct DvdInterface {
     pub cmdbuf2: u32,
     pub immbuf: u32,
     pub dvd: Option<Box<dyn image::Dvd>>,
+    /// When enabled, data commands are completed by the host through AsyncDiscPort.
+    pub async_reads_enabled: bool,
+    pub async_port: AsyncDiscPort,
 }
 
 impl DvdInterface {
@@ -37,6 +41,8 @@ impl DvdInterface {
             cmdbuf2: 0,
             immbuf: 0,
             dvd: None,
+            async_reads_enabled: false,
+            async_port: AsyncDiscPort::new(),
         }
     }
 
@@ -111,11 +117,42 @@ pub fn start_transfer<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
         return;
     };
 
+    let mut waiting_for_async_read = false;
     if let Some(cmd) = sys.di.resolve_command() {
-        self::process_dvd_command(sys, cmd, &dvd);
+        if sys.di.async_reads_enabled {
+            if let Some((offset, length, destination)) = async_read_parameters(&sys.di, &cmd) {
+                match sys.di.async_port.begin(offset, length, destination) {
+                    Ok(request) => {
+                        tracing::debug!(
+                            id = request.id,
+                            offset = format!("{:X}", request.offset),
+                            length = request.length,
+                            destination = format!("{:08X}", request.destination),
+                            "Queued asynchronous DVD read"
+                        );
+                        waiting_for_async_read = true;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "Could not queue asynchronous DVD read");
+                        sys.di.status.set_device_error(true);
+                        sys.di.control.set_tstart(false);
+                        self::refresh_interrupts(sys);
+                    }
+                }
+            } else {
+                self::process_dvd_command(sys, cmd, &dvd);
+            }
+        } else {
+            self::process_dvd_command(sys, cmd, &dvd);
+        }
     }
 
     sys.di.dvd = Some(dvd);
+
+    // The host will complete this transfer after its asynchronous File read.
+    if waiting_for_async_read || sys.di.async_port.pending().is_some() {
+        return;
+    }
 
     // The interrupt must not fire until some time!!
     // This is important as it will break the IPL if we immediately raise it...
@@ -143,6 +180,66 @@ pub fn transfer_done_handler<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>) {
 }
 
 #[inline(always)]
+fn async_read_parameters(di: &DvdInterface, cmd: &Command) -> Option<(u64, usize, u32)> {
+    let destination = di.dma_address.address();
+    match cmd {
+        Command::ReadSectorData => {
+            let offset = (di.cmdbuf1 as u64) << 2;
+            let length = di.cmdbuf2 as usize;
+            assert!(length == di.dma_length.length() as usize, "DMA length mismatch");
+            Some((offset, length, destination))
+        }
+        Command::ReadDiskId => {
+            let length = di.dma_length.length() as usize;
+            Some((0, length, destination))
+        }
+        _ => None,
+    }
+}
+
+impl<const SYSTEM: SystemId> System<SYSTEM> {
+    /// Enable host-serviced asynchronous reads for DVD data commands.
+    /// Boot/apploader reads still use the synchronous image API.
+    pub fn enable_async_dvd_reads(&mut self, enabled: bool) {
+        self.di.async_reads_enabled = enabled;
+    }
+
+    /// Obtain the read that the browser host must fulfill, if any.
+    pub fn pending_async_dvd_read(&self) -> Option<DiscReadRequest> {
+        self.di.async_port.pending()
+    }
+
+    /// Finish a host-serviced read, copy it into emulated RAM, and schedule DI completion.
+    pub fn complete_async_dvd_read(&mut self, response: DiscReadResponse) -> Result<(), String> {
+        let request = self
+            .di
+            .async_port
+            .pending()
+            .ok_or_else(|| "no asynchronous DVD read is pending".to_owned())?;
+
+        match self.di.async_port.complete(response) {
+            Ok(bytes) => {
+                let destination = request.destination;
+                let length = request.length;
+                self.mmio.phys_slice_mut(destination, length).copy_from_slice(&bytes);
+                #[cfg(feature = "jit")]
+                self.mmio.queue_icbi_for_range(destination, length as u32);
+                self.scheduler.schedule_in(
+                    crate::scheduler::microseconds_to_cycles(SYSTEM, 20),
+                    crate::scheduler::Handler::DiTransferDone,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.di.status.set_device_error(true);
+                self.di.control.set_tstart(false);
+                self::refresh_interrupts(self);
+                Err(error)
+            }
+        }
+    }
+}
+
 fn process_dvd_command<const SYSTEM: SystemId>(sys: &mut System<SYSTEM>, cmd: Command, dvd: &dyn image::Dvd) {
     match cmd {
         Command::DriveInfo => {

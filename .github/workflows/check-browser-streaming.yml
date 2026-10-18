@@ -1,0 +1,57 @@
+name: Browser streaming build check
+
+on:
+  push:
+    branches: [feat/browser-disc-streaming]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/check-browser-streaming.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/check-browser-streaming.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Init submodules
+        run: |
+          git submodule update --init --depth 1 --recursive submodules/chipi-spec
+          git submodule update --init --depth 1 --recursive submodules/solstice
+          git submodule update --init --depth 1 submodules/dolphin
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: jetli/wasm-pack-action@v0.4.0
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: browser-streaming-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: browser-streaming-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # The web crate's lib tests compile the browser app as a native test binary,
+      # which is unsupported by winit's web-only platform APIs. The production WASM
+      # build is validated below; browser disc range behavior is covered by the
+      # deployed File.slice() diagnostic page.
+      - name: Build web WASM
+        run: wasm-pack build crates/web --target web --out-dir pkg --out-name gecko_web --release

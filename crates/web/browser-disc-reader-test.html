@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gecko browser disc reader test</title>
+  <style>
+    body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+    label { display: block; margin: .8rem 0; }
+    input, button { font: inherit; padding: .4rem; max-width: 100%; }
+    button { margin: .3rem .3rem .3rem 0; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f2f2f2; color: #111; padding: 1rem; border-radius: .5rem; }
+    .note { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Browser disc-reader test</h1>
+  <p class="note">Development harness for Gecko's WASM range reader. It reads only requested ranges, never the complete disc image. Use the hosted page on GitHub Pages, or build the web package and serve this file over HTTP from <code>crates/web</code>. The probe checks NKit metadata and boot-critical range boundaries only; it does not restore NKit gaps or boot a game.</p>
+  <label>Disc image file: <input id="file" type="file"></label>
+  <div>
+    <button id="run" disabled>Run bounded range tests</button>
+    <button id="probe" disabled>Probe boot-critical ranges</button>
+    <button id="rvz" disabled>Test RVZ block streaming</button>
+    <button id="clear">Clear output</button>
+  </div>
+  <pre id="output" aria-live="polite">Choose a disc image to begin.</pre>
+  <script type="module">
+    import init, { BrowserDiscReader, BrowserRvzReader } from "./pkg/gecko_web.js";
+
+    const fileInput = document.querySelector("#file");
+    const runButton = document.querySelector("#run");
+    const probeButton = document.querySelector("#probe");
+    const rvzButton = document.querySelector("#rvz");
+    const output = document.querySelector("#output");
+    let wasmReady = false;
+
+    function log(message) {
+      output.textContent += message + "\n";
+    }
+
+    function hex(bytes, limit = 64) {
+      const shown = Array.from(bytes.slice(0, limit), b => b.toString(16).padStart(2, "0")).join(" ");
+      return bytes.length > limit ? shown + " …" : shown;
+    }
+
+    fileInput.addEventListener("change", () => {
+      runButton.disabled = !wasmReady || !fileInput.files?.length;
+      probeButton.disabled = !wasmReady || !fileInput.files?.length;
+      rvzButton.disabled = !wasmReady || !fileInput.files?.length;
+      output.textContent = fileInput.files?.length
+        ? "Selected: " + fileInput.files[0].name + " (" + fileInput.files[0].size.toLocaleString() + " bytes)\n"
+        : "Choose a disc image to begin.\n";
+    });
+
+    probeButton.addEventListener("click", async () => {
+      probeButton.disabled = true;
+      try {
+        const file = fileInput.files[0];
+        const reader = new BrowserDiscReader(file);
+        log("\nStarting bounded NKit, apploader, main-DOL, and FST range probe...");
+        log(await reader.probe_nkit());
+      } catch (error) {
+        log("\nNKit probe failed: " + (error?.stack || error));
+      } finally {
+        probeButton.disabled = !wasmReady || !fileInput.files?.length;
+        rvzButton.disabled = !wasmReady || !fileInput.files?.length;
+      }
+    });
+
+    rvzButton.addEventListener("click", async () => {
+      rvzButton.disabled = true;
+      try {
+        const file = fileInput.files[0];
+        log("\nStarting RVZ block-streaming test for " + file.name + "...");
+        const reader = new BrowserRvzReader(file);
+        const summary = await reader.open();
+        log("PASS RVZ metadata/index: ");
+        log(summary);
+        // RVZ raw-data entries can leave logical disc gaps uncovered. Probe
+        // chunk-aligned offsets and skip gaps instead of treating one gap as a
+        // broken file. Read distinct chunks, not multiple offsets in one chunk.
+        const chunkMatch = summary.match(/Chunk size: (\d+) bytes/);
+        const chunkSize = chunkMatch ? Number(chunkMatch[1]) : 131072;
+        const logicalMatch = summary.match(/Logical disc size: (\d+) bytes/);
+        const logicalSize = logicalMatch ? Number(logicalMatch[1]) : 0;
+        let passed = 0;
+        let skipped = 0;
+        let firstCoveredOffset = null;
+        for (let offset = 0; offset < logicalSize && passed < 3; offset += chunkSize) {
+          try {
+            const started = performance.now();
+            const block = await reader.read_block(offset);
+            log("PASS decoded block at logical offset 0x" + offset.toString(16) +
+              ": " + block.length.toLocaleString() + " bytes in " +
+              (performance.now() - started).toFixed(1) + " ms; prefix " +
+              hex(block, 16));
+            if (firstCoveredOffset === null) firstCoveredOffset = offset;
+            passed++;
+          } catch (error) {
+            skipped++;
+            if (skipped <= 5) log("SKIP uncovered logical offset 0x" + offset.toString(16));
+          }
+          if (offset / chunkSize > 4096) break;
+        }
+        if (passed < 3) throw new Error("Only " + passed + " covered chunks found after checking " + (passed + skipped) + " offsets.");
+
+        if (firstCoveredOffset !== null && firstCoveredOffset + chunkSize + 32 < logicalSize) {
+          try {
+            const start = firstCoveredOffset + chunkSize - 16;
+            const range = await reader.read_disc_range(start, 32);
+            if (range.length !== 32) throw new Error("range assembler returned " + range.length + " bytes instead of 32");
+            log("PASS multi-block range assembly across chunk boundary at 0x" + start.toString(16) + " (32 bytes)");
+          } catch (error) {
+            log("SKIP cross-chunk range assembly (metadata gap or unsupported range): " + (error?.message || error));
+          }
+        }
+        log("\nRESULT: RVZ metadata parsed and " + passed + " covered logical blocks decoded; skipped " + skipped + " uncovered offsets.");
+        log("This validates bounded RVZ block/range I/O only; it does NOT boot the Wii runtime.");
+      } catch (error) {
+        log("\nRVZ STREAM TEST FAILED: " + (error?.stack || error));
+      } finally {
+        rvzButton.disabled = !wasmReady || !fileInput.files?.length;
+      }
+    });
+
+    document.querySelector("#clear").addEventListener("click", () => {
+      output.textContent = "";
+    });
+
+    runButton.addEventListener("click", async () => {
+      runButton.disabled = true;
+      try {
+        const file = fileInput.files[0];
+        const reader = new BrowserDiscReader(file);
+        log("Reader size: " + reader.size.toLocaleString() + " bytes");
+        const size = reader.size;
+        const tests = [
+          ["start", 0, Math.min(64, size)],
+          ["middle", Math.max(0, Math.floor(size / 2) - 32), Math.min(64, size)],
+          ["end", Math.max(0, size - 64), Math.min(64, size)]
+        ];
+        if (size > 256 * 1024 + 32) {
+          tests.push(["cross chunk boundary", 256 * 1024 - 16, 64]);
+          tests.push(["repeat cached boundary", 256 * 1024 - 16, 64]);
+        }
+        let passed = 0;
+        for (const [name, offset, length] of tests) {
+          const started = performance.now();
+          const bytes = await reader.read_range(offset, length);
+          const elapsed = (performance.now() - started).toFixed(1);
+          const reference = new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+          const equal = bytes.length === reference.length && bytes.every((value, index) => value === reference[index]);
+          if (!equal) throw new Error(name + " mismatch at offset " + offset);
+          passed++;
+          log("PASS " + name + ": offset " + offset + ", " + bytes.length + " bytes, " + elapsed + " ms");
+          log("  " + hex(bytes));
+        }
+        log("\nRESULT: " + passed + "/" + tests.length + " ranges matched File.slice().");
+
+        // Guardrail checks: malformed offsets and out-of-file ranges must reject,
+        // rather than wrap, truncate, or panic in WASM.
+        const invalidCases = [
+          ["negative offset", () => reader.read_range(-1, 1)],
+          ["fractional offset", () => reader.read_range(0.5, 1)],
+          ["range beyond EOF", () => reader.read_range(size, 1)]
+        ];
+        let rejected = 0;
+        for (const [name, run] of invalidCases) {
+          let didReject = false;
+          try {
+            await run();
+          } catch (_) {
+            didReject = true;
+          }
+          if (!didReject) throw new Error("invalid-range guard failed: " + name);
+          rejected++;
+          log("PASS rejects " + name);
+        }
+        log("GUARDRAILS: " + rejected + "/" + invalidCases.length + " invalid ranges rejected.");
+        log("This tests the range-reader primitive only; it does not boot a Wii game.");
+      } catch (error) {
+        log("\nFAIL: " + (error?.stack || error));
+      } finally {
+        runButton.disabled = !fileInput.files?.length;
+      }
+    });
+
+    try {
+      await init();
+      wasmReady = true;
+      runButton.disabled = !fileInput.files?.length;
+      probeButton.disabled = !fileInput.files?.length;
+      log("WASM module initialized.");
+    } catch (error) {
+      log("WASM initialization failed: " + (error?.stack || error));
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+name: Browser disc streaming checks
+
+on:
+  push:
+    branches:
+      - feat/browser-disc-streaming
+    paths:
+      - "crates/web/**"
+      - "crates/gecko/**"
+      - "crates/image/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/browser-disc-streaming.yml"
+  pull_request:
+    paths:
+      - "crates/web/**"
+      - "crates/gecko/**"
+      - "crates/image/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/browser-disc-streaming.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-check:
+    name: Compile web frontend for wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Initialize required submodules
+        run: |
+          git submodule update --init --depth 1 --recursive submodules/chipi-spec
+          git submodule update --init --depth 1 --recursive submodules/solstice
+          git submodule update --init --depth 1 submodules/dolphin
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Check browser frontend
+        run: cargo check --manifest-path crates/web/Cargo.toml --target wasm32-unknown-unknown
+      # The web crate is browser-only and cannot be executed as a native test
+      # binary. Its wasm32 compilation above validates the reader module; the
+      # browser's live File.slice() checks are exercised by the Pages test page.
