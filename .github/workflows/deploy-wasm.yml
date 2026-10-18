@@ -44,17 +44,11 @@ jobs:
       - name: Build WASM
         run: wasm-pack build crates/web --target web --out-dir pkg --out-name gecko_web --release
 
-      - name: Build WASM (debug)
-        run: wasm-pack build crates/web --target web --out-dir pkg-dbg --out-name gecko_web --release -- --features debug
-
       - name: Prepare site
         run: |
-          mkdir -p _site/dbg
+          mkdir -p _site
           cp crates/web/index.html _site/
           cp -r crates/web/pkg _site/pkg
-          cp crates/web/index.html _site/dbg/
-          sed -i 's|./pkg/gecko_web.js|../pkg-dbg/gecko_web.js|' _site/dbg/index.html
-          cp -r crates/web/pkg-dbg _site/pkg-dbg
 
       - uses: actions/upload-pages-artifact@v3
 
