@@ -472,7 +472,7 @@ impl ApploaderHleBuilder {
 
             let addr = emu.read_u32(APPLOADER_ARG_BASE);
             let length = emu.read_u32(APPLOADER_ARG_BASE + 4) as usize;
-            let offset = (emu.read_u32(APPLOADER_ARG_BASE + 8) as u64 << 2) as usize;
+            let offset = ((emu.read_u32(APPLOADER_ARG_BASE + 8) as u64) << 2) as usize;
             assert!(length <= 16 * 1024 * 1024, "apploader requested an oversized disc read");
             let bytes = read_disc(offset, length).await;
             assert_eq!(bytes.len(), length, "short async apploader disc read");
