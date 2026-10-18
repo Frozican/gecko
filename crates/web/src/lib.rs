@@ -306,7 +306,7 @@ impl State {
 
     fn render(
         &mut self,
-        emulator: &mut GameCube,
+        emulator: &mut Wii,
         action_queue: &WebSinkQueue,
         #[cfg(feature = "debug")] debug_state: &mut debug_ui::DebugState,
         window: &Window,
@@ -606,7 +606,7 @@ pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8
         emulator.dsp.load_irom(&irom);
     }
 
-    let input = HostInput::gc_connected();
+    let input = HostInput::wii_neutral();
     emulator.apply_host_input(&input);
 
     // Install the WebSink as the emulator's render sink.
