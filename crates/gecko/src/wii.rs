@@ -401,6 +401,92 @@ impl ApploaderHleBuilder {
         self
     }
 
+    /// Run the Wii apploader while fetching each disc range asynchronously.
+    ///
+    /// The callback must return exactly `length` bytes for the requested disc
+    /// offset. This yields to the browser between apploader reads instead of
+    /// blocking the event loop on each read.
+    pub async fn build_async<F, Fut>(self, mut read_disc: F) -> Wii
+    where
+        F: FnMut(usize, usize) -> Fut,
+        Fut: std::future::Future<Output = Vec<u8>>,
+    {
+        let dvd = self.dvd;
+        assert!(dvd.header().is_wii(), "apploader HLE only supports Wii discs");
+
+        let game_name = String::from_utf8_lossy(&dvd.header().game_name);
+        tracing::info!("Wii async boot: {}", game_name.trim_end_matches('\\0'));
+
+        let mut emu = Wii::new(0);
+        Wii::setup_bats(&mut emu);
+        Wii::setup_msr_hid(&mut emu);
+        Wii::setup_low_memory(&mut emu, dvd.as_ref());
+        Wii::setup_post_ios_handoff(&mut emu);
+
+        let apploader = *dvd.apploader();
+        let apploader_entry = apploader.entrypoint.get();
+        let apploader_size = (apploader.size.get() + apploader.trailer_size.get()) as usize;
+        let apploader_offset = DVD_APPLOADER_OFFSET + 0x20;
+        let apploader_bytes = read_disc(apploader_offset, apploader_size).await;
+        assert_eq!(apploader_bytes.len(), apploader_size, "short async apploader read");
+        emu.mmio.virt_slice_mut(APPLOADER_BASE, apploader_size).copy_from_slice(&apploader_bytes);
+
+        emu.mmio.virt_write_u32(OSREPORT_STUB, PPC_BLR);
+        emu.mmio.virt_write_u32(0x8000_0300, PPC_RFI);
+        emu.mmio.virt_write_u32(0x8000_0800, PPC_RFI);
+        emu.mmio.virt_write_u32(0x8000_0C00, PPC_RFI);
+        emu.gekko.gprs[1] = APPLOADER_STACK;
+
+        #[cfg(feature = "hooks")]
+        if let Some(host) = self.host {
+            emu.set_hook_host(host);
+        }
+
+        let call_function = |emu: &mut Wii, entry: u32| {
+            emu.gekko.spr.lr = APPLOADER_RETURN_TRAP;
+            emu.run_until(entry, |sys| sys.gekko.pc == APPLOADER_RETURN_TRAP);
+        };
+
+        // Apploader_Entry(init_func, main_func, close_func)
+        emu.gekko.gprs[3] = APPLOADER_ARG_BASE;
+        emu.gekko.gprs[4] = APPLOADER_ARG_BASE + 4;
+        emu.gekko.gprs[5] = APPLOADER_ARG_BASE + 8;
+        call_function(&mut emu, apploader_entry);
+        let init_ptr = emu.read_u32(APPLOADER_ARG_BASE);
+        let main_ptr = emu.read_u32(APPLOADER_ARG_BASE + 4);
+        let close_ptr = emu.read_u32(APPLOADER_ARG_BASE + 8);
+        assert!(init_ptr != 0 && main_ptr != 0 && close_ptr != 0);
+
+        emu.gekko.gprs[3] = OSREPORT_STUB;
+        call_function(&mut emu, init_ptr);
+
+        // Main() is resumed only after its requested range has arrived.
+        loop {
+            emu.gekko.gprs[3] = APPLOADER_ARG_BASE;
+            emu.gekko.gprs[4] = APPLOADER_ARG_BASE + 4;
+            emu.gekko.gprs[5] = APPLOADER_ARG_BASE + 8;
+            call_function(&mut emu, main_ptr);
+            if emu.gekko.gprs[3] == 0 {
+                break;
+            }
+
+            let addr = emu.read_u32(APPLOADER_ARG_BASE);
+            let length = emu.read_u32(APPLOADER_ARG_BASE + 4) as usize;
+            let offset = (emu.read_u32(APPLOADER_ARG_BASE + 8) as u64 << 2) as usize;
+            assert!(length <= 16 * 1024 * 1024, "apploader requested an oversized disc read");
+            let bytes = read_disc(offset, length).await;
+            assert_eq!(bytes.len(), length, "short async apploader disc read");
+            emu.mmio.virt_slice_mut(addr, length).copy_from_slice(&bytes);
+        }
+
+        call_function(&mut emu, close_ptr);
+        let entrypoint = emu.gekko.gprs[3];
+        assert!(entrypoint != 0, "Apploader_ReturnEpilogue() returned null entrypoint");
+        emu.gekko.pc = entrypoint;
+        emu.insert_dvd(dvd);
+        emu
+    }
+
     pub fn build(self) -> Wii {
         Wii::apploader_hle_run(
             self.dvd,
