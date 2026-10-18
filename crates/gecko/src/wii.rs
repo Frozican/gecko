@@ -415,7 +415,7 @@ impl ApploaderHleBuilder {
         assert!(dvd.header().is_wii(), "apploader HLE only supports Wii discs");
 
         let game_name = String::from_utf8_lossy(&dvd.header().game_name);
-        tracing::info!("Wii async boot: {}", game_name.trim_end_matches('\\0'));
+        tracing::info!("Wii async boot: {}", game_name.trim_end_matches('\0'));
 
         let mut emu = Wii::new(0);
         Wii::setup_bats(&mut emu);
