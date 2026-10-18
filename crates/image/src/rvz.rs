@@ -210,8 +210,7 @@ impl RvzRangeIndex {
             .get(index)
             .ok_or_else(|| format!("RVZ group table index {index} out of range"))?;
         let group_offset = group_index * self.chunk_size as u64;
-        let output_size =
-            core::cmp::min(self.chunk_size as u64, raw.data_size.saturating_sub(group_offset)) as usize;
+        let output_size = core::cmp::min(self.chunk_size as u64, raw.data_size.saturating_sub(group_offset)) as usize;
         Ok((
             RvzBlockDescriptor {
                 file_offset: group.file_offset,
