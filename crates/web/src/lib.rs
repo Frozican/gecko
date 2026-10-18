@@ -1,3 +1,5 @@
+mod disc_stream;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
