@@ -20,15 +20,17 @@
   <div>
     <button id="run" disabled>Run bounded range tests</button>
     <button id="probe" disabled>Probe boot-critical ranges</button>
+    <button id="rvz" disabled>Test RVZ block streaming</button>
     <button id="clear">Clear output</button>
   </div>
   <pre id="output" aria-live="polite">Choose a disc image to begin.</pre>
   <script type="module">
-    import init, { BrowserDiscReader } from "./pkg/gecko_web.js";
+    import init, { BrowserDiscReader, BrowserRvzReader } from "./pkg/gecko_web.js";
 
     const fileInput = document.querySelector("#file");
     const runButton = document.querySelector("#run");
     const probeButton = document.querySelector("#probe");
+    const rvzButton = document.querySelector("#rvz");
     const output = document.querySelector("#output");
     let wasmReady = false;
 
@@ -44,6 +46,7 @@
     fileInput.addEventListener("change", () => {
       runButton.disabled = !wasmReady || !fileInput.files?.length;
       probeButton.disabled = !wasmReady || !fileInput.files?.length;
+      rvzButton.disabled = !wasmReady || !fileInput.files?.length;
       output.textContent = fileInput.files?.length
         ? "Selected: " + fileInput.files[0].name + " (" + fileInput.files[0].size.toLocaleString() + " bytes)\n"
         : "Choose a disc image to begin.\n";
@@ -60,6 +63,33 @@
         log("\nNKit probe failed: " + (error?.stack || error));
       } finally {
         probeButton.disabled = !wasmReady || !fileInput.files?.length;
+        rvzButton.disabled = !wasmReady || !fileInput.files?.length;
+      }
+    });
+
+    rvzButton.addEventListener("click", async () => {
+      rvzButton.disabled = true;
+      try {
+        const file = fileInput.files[0];
+        log("\\nStarting RVZ block-streaming test for " + file.name + "...");
+        const reader = new BrowserRvzReader(file);
+        const summary = await reader.open();
+        log("PASS RVZ metadata/index: ");
+        log(summary);
+        for (const offset of [0, 0x10000, 0x80000]) {
+          const started = performance.now();
+          const block = await reader.read_block(offset);
+          log("PASS decoded block at logical offset 0x" + offset.toString(16) +
+            ": " + block.length.toLocaleString() + " bytes in " +
+            (performance.now() - started).toFixed(1) + " ms; prefix " +
+            hex(block, 16));
+        }
+        log("\\nRESULT: RVZ header/tables parsed and 3 logical block reads completed.");
+        log("This validates bounded RVZ block I/O only; it does NOT boot the Wii runtime.");
+      } catch (error) {
+        log("\\nRVZ STREAM TEST FAILED: " + (error?.stack || error));
+      } finally {
+        rvzButton.disabled = !wasmReady || !fileInput.files?.length;
       }
     });
 
