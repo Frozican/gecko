@@ -117,10 +117,10 @@
 
     <div id="setup">
         <div class="file-row">
-            <label class="file-label">Game / IPL:</label>
+            <label class="file-label">IPL / DOL:</label>
             <label class="file-picker">
-                <span>Choose game / disc</span>
-                <input type="file" id="input-rom" accept=".dol,.iso,.rvz">
+                <span>Choose file</span>
+                <input type="file" id="input-rom" accept=".dol,.bin">
             </label>
             <span class="name" id="rom-name">none</span>
         </div>
@@ -154,10 +154,9 @@
             const startBtn = document.getElementById('start');
 
             function readFile(file) {
-                return new Promise((resolve, reject) => {
+                return new Promise((resolve) => {
                     const reader = new FileReader();
                     reader.onload = () => resolve(new Uint8Array(reader.result));
-                    reader.onerror = () => reject(reader.error || new Error('Could not read the selected file'));
                     reader.readAsArrayBuffer(file);
                 });
             }
@@ -165,19 +164,10 @@
             inputRom.addEventListener('change', async (e) => {
                 if (e.target.files.length > 0) {
                     const file = e.target.files[0];
-                    startBtn.disabled = true;
-                    romNameEl.textContent = 'Reading file…';
-                    try {
-                        romData = await readFile(file);
-                        romName = file.name;
-                        romNameEl.textContent = file.name + ' (' + (file.size / (1024 * 1024)).toFixed(0) + ' MiB)';
-                        startBtn.disabled = false;
-                    } catch (error) {
-                        romData = null;
-                        romNameEl.textContent = 'Read failed';
-                        console.error('Could not read selected game image:', error);
-                        alert('Could not read the selected file. Check available device memory and try again.');
-                    }
+                    romData = await readFile(file);
+                    romName = file.name;
+                    romNameEl.textContent = file.name;
+                    startBtn.disabled = false;
                 }
             });
 
