@@ -189,6 +189,13 @@ impl RvzRangeIndex {
         })
     }
 
+    /// Return the byte offset within the decoded chunk containing a logical disc offset.
+    pub fn offset_in_block(&self, disc_offset: u64) -> Result<usize, String> {
+        let raw = self.raw_data.iter().find(|r| disc_offset >= r.data_offset && disc_offset < r.data_offset.saturating_add(r.data_size))
+            .ok_or_else(|| format!("disc offset {disc_offset:#x} is not covered by RVZ metadata"))?;
+        Ok(((disc_offset - raw.data_offset) % self.chunk_size as u64) as usize)
+    }
+
     /// Resolve a logical disc offset to the compressed file range and output size.
     pub fn block_for_disc_offset(&self, disc_offset: u64) -> Result<(RvzBlockDescriptor, u64, usize), String> {
         let raw = self
