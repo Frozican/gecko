@@ -579,11 +579,21 @@ pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8
     console_error_panic_hook::set_once();
 
     let name = filename.to_lowercase();
-    let mut emulator = if name.ends_with(".bin") || name.ends_with(".ipl") {
+    let mut emulator = if name.ends_with(".iso") || name.ends_with(".rvz") || name.ends_with(".gcm") {
+        // Disc images must enter the DVD/apploader boot path. Parsing them as
+        // DOL executables produces a blank screen instead of booting the game.
+        // RVZ decoding is enabled for this web crate via image's "rvz" feature.
+        GameCube::with_ipl_hle(image::load_dvd(rom_data.to_vec()))
+    } else if name.ends_with(".bin") || name.ends_with(".ipl") {
         GameCube::with_ipl(rom_data, false)
-    } else {
+    } else if name.ends_with(".dol") {
         let dol = Dol::parse(rom_data.to_vec());
         GameCube::with_image(&dol)
+    } else {
+        web_sys::console::error_1(
+            &format!("Unsupported file type: {filename}. Choose a Wii .iso/.rvz, GameCube .gcm, .dol, or .ipl/.bin file.").into(),
+        );
+        return;
     };
 
     if let Some(irom) = dsp_irom {
