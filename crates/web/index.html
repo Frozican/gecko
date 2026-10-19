@@ -139,7 +139,7 @@
     </div>
 
     <script type="module">
-        import init, { start_emulator } from './pkg/gecko_web.js';
+        import init, { begin_emulator_rom_load, write_emulator_rom_chunk, finish_emulator_rom_load, cancel_emulator_rom_load } from './pkg/gecko_web.js';
 
         async function run() {
             await init();
