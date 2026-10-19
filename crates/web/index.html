@@ -156,39 +156,38 @@
             const loadStatus = document.getElementById('load-status');
             const CHUNK_SIZE = 8 * 1024 * 1024;
 
-            // Keep each temporary read bounded instead of allocating a second
-            // whole-file ArrayBuffer. The current Rust/WASM API still requires
-            // one complete byte array, but this avoids the extra full-file buffer.
-            async function readFileInChunks(file, label) {
+            // Read each bounded slice and copy it directly into the WASM-owned ROM buffer.
+            async function streamFileToWasm(file, label) {
                 if (file.size > 0xFFFFFFFF) throw new Error('Files larger than 4 GiB are not supported by this loader.');
-                const result = new Uint8Array(file.size);
+                cancel_emulator_rom_load();
+                begin_emulator_rom_load(file.size);
                 for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
                     const end = Math.min(offset + CHUNK_SIZE, file.size);
-                    const part = await file.slice(offset, end).arrayBuffer();
-                    result.set(new Uint8Array(part), offset);
+                    const part = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+                    write_emulator_rom_chunk(offset, part);
                     loadStatus.textContent = label + ': reading ' + Math.round(end / file.size * 100) + '% (' + Math.round(end / 1048576) + ' / ' + Math.round(file.size / 1048576) + ' MiB)';
                     await new Promise(resolve => setTimeout(resolve, 0));
                 }
-                return result;
             }
 
             inputRom.addEventListener('change', async (e) => {
                 const file = e.target.files && e.target.files[0];
                 if (!file) return;
                 startBtn.disabled = true;
-                romData = null;
+                romReady = false;
                 romName = file.name;
                 romNameEl.textContent = file.name;
                 try {
-                    romData = await readFileInChunks(file, 'Disc image');
+                    await streamFileToWasm(file, 'Disc image');
+                    romReady = true;
                     loadStatus.textContent = 'Loaded ' + file.name + '. Ready to start.';
                     startBtn.disabled = false;
                 } catch (error) {
-                    loadStatus.textContent = 'Could not read file: ' + error.message;
+                    cancel_emulator_rom_load();
+                    loadStatus.textContent = 'Could not load file: ' + error.message;
                     romNameEl.textContent = 'failed';
                 }
             });
-
             inputDsp.addEventListener('change', async (e) => {
                 if (e.target.files.length > 0) {
                     const file = e.target.files[0];
