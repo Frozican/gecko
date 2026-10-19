@@ -570,12 +570,65 @@ impl ApplicationHandler for App {
     }
 }
 
+thread_local! {
+    // Keep the full ROM in WASM memory, rather than a JS Uint8Array, so the
+    // browser does not retain a second multi-gigabyte copy during startup.
+    static PENDING_ROM: RefCell<Option<(usize, Vec<u8>)>> = const { RefCell::new(None) };
+}
+
 #[wasm_bindgen]
-pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8>>) {
+pub fn begin_emulator_rom_load(size: u32) -> Result<(), JsValue> {
+    let size = size as usize;
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(size).map_err(|e| {
+        JsValue::from_str(&format!("Unable to reserve {size} bytes for the disc image: {e}"))
+    })?;
+    PENDING_ROM.with(|pending| *pending.borrow_mut() = Some((size, buffer)));
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn write_emulator_rom_chunk(offset: u32, chunk: &[u8]) -> Result<(), JsValue> {
+    PENDING_ROM.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        let (expected_size, buffer) = pending.as_mut().ok_or_else(|| JsValue::from_str("Disc load was not initialized"))?;
+        let start = offset as usize;
+        if start != buffer.len() {
+            return Err(JsValue::from_str("Disc chunks must be written sequentially"));
+        }
+        let end = start.checked_add(chunk.len()).ok_or_else(|| JsValue::from_str("Disc chunk offset overflow"))?;
+        if end > *expected_size {
+            return Err(JsValue::from_str("Disc chunk is outside the allocated image"));
+        }
+        buffer.extend_from_slice(chunk);
+        Ok(())
+    })
+}
+
+#[wasm_bindgen]
+pub fn finish_emulator_rom_load(filename: String, dsp_irom: Option<Vec<u8>>) -> Result<(), JsValue> {
+    let (expected_size, rom_data) = PENDING_ROM.with(|pending| pending.borrow_mut().take())
+        .ok_or_else(|| JsValue::from_str("No disc image is currently being loaded"))?;
+    if rom_data.len() != expected_size {
+        return Err(JsValue::from_str("Disc image upload is incomplete"));
+    }
+    start_emulator(rom_data, filename, dsp_irom);
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn cancel_emulator_rom_load() {
+    PENDING_ROM.with(|pending| { pending.borrow_mut().take(); });
+}
+
+#[wasm_bindgen]
+pub fn start_emulator(rom_data: Vec<u8>, filename: String, dsp_irom: Option<Vec<u8>>) {
     console_error_panic_hook::set_once();
 
     let _name = filename.to_lowercase();
-    let dvd = image::load_dvd(rom_data.to_vec());
+    // Take ownership of the uploaded ROM buffer. Avoid duplicating a multi-gigabyte
+    // disc image with `to_vec()` at emulator startup.
+    let dvd = image::load_dvd(rom_data);
     let mut emulator = Wii::apploader_hle(dvd).build();
 
     if let Some(irom) = dsp_irom {
