@@ -197,11 +197,11 @@
             });
 
             startBtn.addEventListener('click', () => {
-                if (!romData) return;
+                if (!romReady) return;
                 startBtn.disabled = true;
                 loadStatus.textContent = 'Starting emulator…';
                 document.getElementById('setup').style.display = 'none';
-                start_emulator(romData, romName, dspData ?? undefined);
+                finish_emulator_rom_load(romName, dspData ?? undefined);
             });
         }
 
