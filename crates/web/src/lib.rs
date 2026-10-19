@@ -571,11 +571,13 @@ impl ApplicationHandler for App {
 }
 
 #[wasm_bindgen]
-pub fn start_emulator(rom_data: &[u8], filename: String, dsp_irom: Option<Vec<u8>>) {
+pub fn start_emulator(rom_data: Vec<u8>, filename: String, dsp_irom: Option<Vec<u8>>) {
     console_error_panic_hook::set_once();
 
     let _name = filename.to_lowercase();
-    let dvd = image::load_dvd(rom_data.to_vec());
+    // Take ownership of the uploaded ROM buffer. Avoid duplicating a multi-gigabyte
+    // disc image with `to_vec()` at emulator startup.
+    let dvd = image::load_dvd(rom_data);
     let mut emulator = Wii::apploader_hle(dvd).build();
 
     if let Some(irom) = dsp_irom {
