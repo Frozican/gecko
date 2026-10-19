@@ -573,7 +573,7 @@ impl ApplicationHandler for App {
 thread_local! {
     // Keep the full ROM in WASM memory, rather than a JS Uint8Array, so the
     // browser does not retain a second multi-gigabyte copy during startup.
-    static PENDING_ROM: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    static PENDING_ROM: RefCell<Option<(usize, Vec<u8>)>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen]
@@ -583,8 +583,7 @@ pub fn begin_emulator_rom_load(size: u32) -> Result<(), JsValue> {
     buffer.try_reserve_exact(size).map_err(|e| {
         JsValue::from_str(&format!("Unable to reserve {size} bytes for the disc image: {e}"))
     })?;
-    buffer.resize(size, 0);
-    PENDING_ROM.with(|pending| *pending.borrow_mut() = Some(buffer));
+    PENDING_ROM.with(|pending| *pending.borrow_mut() = Some((size, buffer)));
     Ok(())
 }
 
@@ -592,19 +591,27 @@ pub fn begin_emulator_rom_load(size: u32) -> Result<(), JsValue> {
 pub fn write_emulator_rom_chunk(offset: u32, chunk: &[u8]) -> Result<(), JsValue> {
     PENDING_ROM.with(|pending| {
         let mut pending = pending.borrow_mut();
-        let buffer = pending.as_mut().ok_or_else(|| JsValue::from_str("Disc load was not initialized"))?;
+        let (expected_size, buffer) = pending.as_mut().ok_or_else(|| JsValue::from_str("Disc load was not initialized"))?;
         let start = offset as usize;
+        if start != buffer.len() {
+            return Err(JsValue::from_str("Disc chunks must be written sequentially"));
+        }
         let end = start.checked_add(chunk.len()).ok_or_else(|| JsValue::from_str("Disc chunk offset overflow"))?;
-        let target = buffer.get_mut(start..end).ok_or_else(|| JsValue::from_str("Disc chunk is outside the allocated image"))?;
-        target.copy_from_slice(chunk);
+        if end > *expected_size {
+            return Err(JsValue::from_str("Disc chunk is outside the allocated image"));
+        }
+        buffer.extend_from_slice(chunk);
         Ok(())
     })
 }
 
 #[wasm_bindgen]
 pub fn finish_emulator_rom_load(filename: String, dsp_irom: Option<Vec<u8>>) -> Result<(), JsValue> {
-    let rom_data = PENDING_ROM.with(|pending| pending.borrow_mut().take())
+    let (expected_size, rom_data) = PENDING_ROM.with(|pending| pending.borrow_mut().take())
         .ok_or_else(|| JsValue::from_str("No disc image is currently being loaded"))?;
+    if rom_data.len() != expected_size {
+        return Err(JsValue::from_str("Disc image upload is incomplete"));
+    }
     start_emulator(rom_data, filename, dsp_irom);
     Ok(())
 }
